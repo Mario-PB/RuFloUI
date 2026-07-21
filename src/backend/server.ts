@@ -1275,7 +1275,7 @@ async function launchSwarmPipeline(
       reviewer: 'REVIEW phase: review the code changes for quality, bugs, security issues, and adherence to project conventions',
       analyst: 'ANALYSIS phase: analyze requirements, define technical specifications',
       architect: 'ARCHITECTURE phase: design the solution structure, define interfaces and patterns',
-      'devops-engineer': 'DEVOPS IMPLEMENTATION phase: inspect and modify infrastructure, services, CI, configuration and operational scripts; never push, merge or deploy without explicit authorization',
+      'swarm-specialist': 'DEVOPS IMPLEMENTATION phase: inspect and modify infrastructure, services, CI, configuration and operational scripts; never push, merge or deploy without explicit authorization',
       'security-architect': 'SECURITY phase: inspect authentication, authorization, tenant isolation, secrets and dependency risks; provide fail-closed recommendations',
     }
 
@@ -1394,7 +1394,7 @@ async function launchSwarmPipeline(
             reviewer: 'You are a code reviewer agent. Review the code changes for bugs, security issues, style problems, and adherence to best practices. Report issues found.',
             analyst: 'You are an analyst agent. Analyze requirements and produce clear technical specifications.',
             architect: 'You are an architect agent. Design system architecture, define patterns, interfaces and data flow.',
-            'devops-engineer': 'You are a DevOps implementation engineer. Inspect and modify infrastructure, service units, CI, configuration, and operational scripts. Build and verify before restart. Never push, merge, deploy, or expose secrets unless explicitly authorized. Remain read-only when the task says READ-ONLY.',
+            'swarm-specialist': 'You are a DevOps implementation engineer. Inspect and modify infrastructure, service units, CI, configuration, and operational scripts. Build and verify before restart. Never push, merge, deploy, or expose secrets unless explicitly authorized. Remain read-only when the task says READ-ONLY.',
             'security-architect': 'You are a security architect. Inspect authentication, authorization, tenant isolation, secrets, dependency risks, and fail-closed behavior. Remain read-only unless implementation is explicitly authorized.',
           }
           const agentPrompt = `Complete this task:\n\n${st.task}${depContext}`
@@ -1837,7 +1837,7 @@ function swarmRoutes(): Router {
       { type: 'researcher', name: 'Cartographer' },
       { type: 'architect', name: 'System Architect' },
       { type: 'coder', name: 'Full-stack Engineer' },
-      { type: 'devops-engineer', name: 'DevOps Engineer' },
+      { type: 'swarm-specialist', name: 'DevOps Engineer' },
       { type: 'security-architect', name: 'Security Auditor' },
       { type: 'tester', name: 'QA Auditor' },
       { type: 'reviewer', name: 'Final Reviewer' },
