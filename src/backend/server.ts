@@ -1950,36 +1950,40 @@ const busyAgents = new Set<string>()
 let currentSwarmAgentIds = new Set<string>()
 
 // Purge all CLI agents — parallel batches of 10 for speed
-async function purgeAllCliAgents(): Promise<number> {
-  let stopped = 0
-  try {
-    const { parsed } = await execCli('agent', ['list', '--format', 'json'])
+  async function purgeAllCliAgents(): Promise<number> {
+    const { parsed } = await execCli("agent", ["list", "--format", "json"])
     const data = parsed as Record<string, unknown>
     const agents = (data?.agents || []) as Array<Record<string, unknown>>
-    const ids = agents.map(a => String(a.agentId || a.id || '')).filter(Boolean)
-    // Process in parallel batches of 10
+    const ids = agents.map(agent => String(agent.agentId || agent.id || "")).filter(Boolean)
+    const failures: string[] = []
+    let stopped = 0
     const batchSize = 10
-    for (let i = 0; i < ids.length; i += batchSize) {
-      const batch = ids.slice(i, i + batchSize)
+
+    for (let index = 0; index < ids.length; index += batchSize) {
+      const batch = ids.slice(index, index + batchSize)
       const results = await Promise.allSettled(
-        batch.map(id => execCli('agent', ['stop', id]))
+        batch.map(id => execCli("agent", ["stop", id]))
       )
-      stopped += results.filter(r => r.status === 'fulfilled').length
+      results.forEach((result, resultIndex) => {
+        if (result.status === "fulfilled") stopped++
+        else failures.push(batch[resultIndex])
+      })
     }
-  } catch (e) {
-    console.warn('[purge] Failed to list/stop CLI agents:', e instanceof Error ? e.message : String(e))
+
+    if (failures.length > 0) {
+      throw new Error(`Failed to stop ${failures.length} of ${ids.length} CLI agents`)
+    }
+
+    agentRegistry.clear()
+    terminatedAgents.clear()
+    agentActivity.clear()
+    agentOutputBuffers.clear()
+    busyAgents.clear()
+    currentSwarmAgentIds.clear()
+    allTerminatedBefore = null
+    persistState()
+    return stopped
   }
-  // Clear all local tracking
-  agentRegistry.clear()
-  terminatedAgents.clear()
-  agentActivity.clear()
-  agentOutputBuffers.clear()
-  busyAgents.clear()
-  currentSwarmAgentIds.clear()
-  allTerminatedBefore = null
-  persistState()
-  return stopped
-}
 
 function findSwarmAgentForType(subagentType: string): { id: string; name: string; type: string } | null {
   // Map subagent_type back to swarm agent types
@@ -2165,21 +2169,12 @@ function agentRoutes(): Router {
     broadcast('agent:removed', { id })
     res.json({ id, status: 'terminated' })
   }))
-  r.post('/terminate-all', h(async (_req, res) => {
-    // Set the cutoff: any CLI agent from before NOW is considered terminated
-    allTerminatedBefore = new Date().toISOString()
-    // Also mark all registry agents
-    for (const [timeKey] of agentRegistry.entries()) {
-      terminatedAgents.add(timeKey)
-    }
-    // Try CLI stop all
-    try { await execCli('agent', ['stop', '--all']) } catch (e) {
-      console.log('[agent] CLI stop --all skipped:', e instanceof Error ? e.message : String(e))
-    }
-    agentActivity.clear()
-    broadcast('agents:cleared', {})
-    res.json({ terminated: 'all', status: 'all terminated' })
+  r.post("/terminate-all", h(async (_req, res) => {
+    const stopped = await purgeAllCliAgents()
+    broadcast("agents:cleared", {})
+    res.json({ terminated: stopped, status: "all terminated" })
   }))
+
   r.patch('/:id', h(async (req, res) => {
     const id = String(req.params.id)
     res.json({ id, updated: true, ...req.body })
