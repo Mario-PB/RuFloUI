@@ -11,6 +11,7 @@ export default defineConfig({
     },
   },
   server: {
+    allowedHosts: ['operone.duckdns.org'],
     port: 28588,
     proxy: {
       '/api': 'http://localhost:28580',
