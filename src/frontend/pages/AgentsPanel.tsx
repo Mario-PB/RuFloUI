@@ -85,7 +85,7 @@ export default function AgentsPanel() {
   // WebSocket for real-time agent activity
   useEffect(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const ws = new WebSocket(`${protocol}//${window.location.hostname}:28580/ws`)
+    const ws = new WebSocket(`${protocol}//${window.location.host}/ws`)
     ws.onmessage = (evt) => {
       try {
         const msg = JSON.parse(evt.data)

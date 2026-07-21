@@ -342,7 +342,7 @@ export default function TasksPanel() {
   // WebSocket for live task output
   useEffect(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const ws = new WebSocket(`${protocol}//${window.location.hostname}:28580/ws`)
+    const ws = new WebSocket(`${protocol}//${window.location.host}/ws`)
     wsRef.current = ws
     ws.onmessage = (evt) => {
       try {
