@@ -228,8 +228,8 @@ export default function Dashboard() {
 
   const handleInitSwarm = async () => {
     try {
-      await api.swarm.init({ topology: 'hierarchical', maxAgents: 8, strategy: 'specialized' })
-      addLog({ level: 'info', message: 'Swarm initialized', source: 'dashboard' })
+      await api.swarm.init({ topology: 'hierarchical', maxAgents: 10, strategy: 'specialized' })
+      addLog({ level: 'info', message: 'Swarm initialized with 10-agent team', source: 'dashboard' })
     } catch (err) {
       addLog({ level: 'error', message: `Swarm init failed: ${(err as Error).message}`, source: 'dashboard' })
     }

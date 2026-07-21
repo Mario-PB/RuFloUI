@@ -116,7 +116,7 @@ function TopologyGraph({ topology, agents }: { topology: Topology; agents: Agent
 export default function SwarmPanel() {
   const { swarm, setSwarm, agents } = useStore()
   const [topology, setTopology] = useState<Topology>('hierarchical')
-  const [maxAgents, setMaxAgents] = useState(8)
+  const [maxAgents, setMaxAgents] = useState(10)
   const [strategy, setStrategy] = useState<Strategy>('specialized')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)

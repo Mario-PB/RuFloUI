@@ -12,6 +12,8 @@ import { startMonitoring, stopMonitoring, getSessionTree, getAllMonitoredSession
 import { initTelegramBot, TelegramConfig, TelegramHandle } from './telegram-bot'
 import { loadGitHubWebhookConfig, saveGitHubWebhookConfig, githubWebhookRoutes, updateWebhookEventByTaskId } from './webhook-github'
 import { loadGitLabWebhookConfig, saveGitLabWebhookConfig, gitlabWebhookRoutes, updateGitLabEventByTaskId } from './webhook-gitlab'
+import { AGENT_PROFILES, AgentProfile, findProfileById, stripTerminalReviewerAliases } from './agent-profiles'
+import { GlobalScheduler, getGlobalScheduler, resetGlobalScheduler, SubtaskRequest, Priority } from './scheduler'
 
 const execAsync = promisify(exec)
 const execFileAsync = promisify(execFile)
@@ -372,7 +374,7 @@ function loadFromDisk() {
       lastSwarmId = state.swarmConfig.id || ''
       lastSwarmTopology = state.swarmConfig.topology || 'hierarchical'
       lastSwarmStrategy = state.swarmConfig.strategy || 'specialized'
-      lastSwarmMaxAgents = state.swarmConfig.maxAgents || 8
+      lastSwarmMaxAgents = state.swarmConfig.maxAgents || 10
       lastSwarmCreatedAt = state.swarmConfig.createdAt || ''
       swarmShutdown = state.swarmConfig.shutdown ?? true
     }
@@ -780,7 +782,7 @@ function systemRoutes(): Router {
 let lastSwarmId = ''
 let lastSwarmTopology = 'hierarchical'
 let lastSwarmStrategy = 'specialized'
-let lastSwarmMaxAgents = 8
+let lastSwarmMaxAgents = 10
 let lastSwarmCreatedAt = ''
 let swarmShutdown = true
 let daemonStarted = false
@@ -1116,7 +1118,7 @@ async function storeHiveMindMemory(key: string, value: string): Promise<void> {
 async function launchSwarmPipeline(
   taskId: string, task: TaskRecord, taskDesc: string, title: string,
   wf: WorkflowRecord, workflowId: string,
-  agents: Array<{ id: string; name: string; type: string }>,
+  agents: Array<{ id: string; name: string; type: string; profileId?: string }>,
 ): Promise<void> {
   // Register the UI pipeline as the current swarm.
   currentSwarmAgentIds = new Set(agents.map(agent => agent.id))
@@ -1126,12 +1128,21 @@ async function launchSwarmPipeline(
       id: agent.id,
       name: agent.name,
       type: agent.type,
+      profileId: agent.profileId,
     })
   }
   persistState()
 
   const coordinator = agents.find(a => a.type === 'coordinator')
   const workers = agents.filter(a => a.type !== 'coordinator')
+
+  // Register every agent with the global scheduler so its cap is enforced.
+  const scheduler = getGlobalScheduler()
+  scheduler.registerAgents(agents.filter(a => a.profileId).map(a => ({
+    profileId: a.profileId!,
+    agentId: a.id,
+  })))
+
   const cleanEnv = { ...process.env }
   // Remove ALL Claude env vars that prevent nested sessions
   for (const key of Object.keys(cleanEnv)) {
@@ -1147,6 +1158,8 @@ async function launchSwarmPipeline(
 
   // Helper: run claude -p and return the result text
   // planOnly=true: no tools, single turn — for coordinator planning phase
+  // Callers are responsible for settling any scheduler lease / synthetic
+  // agent exactly once per exit path (close/error/cancel/timeout).
   function runClaude(prompt: string, systemPrompt: string, agentId?: string, planOnly = false): Promise<string> {
     return new Promise((resolve, reject) => {
       if (agentId) {
@@ -1158,7 +1171,8 @@ async function launchSwarmPipeline(
       const packetPrompt = prompt.startsWith('PACKET-ID:')
         ? prompt
         : `PACKET-ID: ${parentPacket}-${packetPhase}\n${packetMode ? 'MODE: ' + packetMode + '\n' : ''}PARENT-TASK-ID: ${taskId}\n${prompt}`
-      const args = ['-p', packetPrompt, '--output-format', 'stream-json', '--verbose']
+      const claudeModel = process.env.RUFLO_CLAUDE_MODEL || 'opus'
+      const args = ['-p', packetPrompt, '--output-format', 'stream-json', '--verbose', '--model', claudeModel]
       if (planOnly) {
         // Restricted mode: no tools, single response — forces pure text output
         args.push('--max-turns', '1')
@@ -1250,7 +1264,10 @@ async function launchSwarmPipeline(
 
   try {
     // ── PHASE 1: Coordinator plans subtasks ──
-    const workerTypes = [...new Set(workers.map(w => w.type))]
+    // Capabilities surface from profile metadata; the scheduler picks the
+    // matching free agent when the time comes.
+    const teamCapabilities = [...new Set(AGENT_PROFILES.flatMap(p => p.capabilities))]
+    const teamRoster = AGENT_PROFILES.map(p => `- ${p.name} (profile: ${p.profileId}, type: ${p.type}, capabilities: ${p.capabilities.join(', ')})`).join('\n')
     const coordinatorId = coordinator?.id
     if (coordinatorId) {
       updateAgentActivity(coordinatorId, { status: 'working', currentTask: taskId, currentAction: 'Planning subtasks...' })
@@ -1277,54 +1294,124 @@ async function launchSwarmPipeline(
       architect: 'ARCHITECTURE phase: design the solution structure, define interfaces and patterns',
       'swarm-specialist': 'DEVOPS IMPLEMENTATION phase: inspect and modify infrastructure, services, CI, configuration and operational scripts; never push, merge or deploy without explicit authorization',
       'security-architect': 'SECURITY phase: inspect authentication, authorization, tenant isolation, secrets and dependency risks; provide fail-closed recommendations',
+      integration: 'INTEGRATION phase: bridge backend and frontend changes; integrate endpoints with UI state, contracts, tests',
+      devops: 'DEVOPS phase: configure infrastructure, systemd units, Dockerfiles, CI pipelines',
+      qa: 'QA phase: design and run tests covering happy path, regression, and concurrency invariants',
+      final: 'FINAL REVIEW phase: synthesize every prior subtask result into one complete deliverable; verify all acceptance criteria',
     }
 
     const planPrompt = [
-      `You are a task coordinator managing a development team. Your job is to break tasks into subtasks and assign them to the RIGHT specialist.`,
+      `You are the Queen Dispatcher coordinating a 10-agent team. Your job is to break tasks into subtasks and tag them with the right CAPABILITY. The global scheduler will pick a free agent matching that capability.`,
       '',
-      `YOUR TEAM (you MUST use ALL relevant roles):`,
-      ...workerTypes.map(t => `- ${t}: ${roleInstructions[t] || 'specialist agent'}`),
+      `TEAM (10 unique profiles):`,
+      teamRoster,
+      '',
+      `AVAILABLE CAPABILITIES: ${teamCapabilities.join(', ')}`,
       '',
       `TASK: ${taskDesc}`,
       hiveMindContext,
       '',
       `RULES:`,
-      `1. You MUST use MULTIPLE agent types — do NOT assign everything to a single agent`,
-      `2. If the task involves modifying existing code, START with a "researcher" subtask to explore the codebase`,
-      `3. After implementation by "coder", ALWAYS add a "tester" or "reviewer" subtask to validate`,
-      `4. Each subtask must be self-contained with enough context for the agent to work independently`,
-      `5. Use depends_on to chain tasks that need results from previous steps`,
-      `6. For full audits, use every relevant specialist and add a final reviewer validation; otherwise use 3-5 subtasks`,
+      `1. Use multiple distinct capabilities — never collapse work onto a single agent type.`,
+      `2. If the task involves modifying existing code, START with an "architecture" or "research" subtask to scope the change.`,
+      `3. After implementation by "coder"/"backend"/"frontend", ALWAYS add a "qa" or "tests" subtask to validate.`,
+      `4. Each subtask must be self-contained with all the context the agent needs.`,
+      `5. Use depends_on to chain tasks that need results from previous steps.`,
+      `6. For audits, use every relevant specialist; otherwise use 3-6 subtasks.`,
+      `7. ALWAYS include a "final-review" subtask that depends on every prior subtask — it is mandatory.`,
       '',
       `Respond ONLY with a JSON array. Each subtask has:`,
-      `- "agent": one of [${workerTypes.map(t => `"${t}"`).join(', ')}]`,
+      `- "capability": one of [${teamCapabilities.map(c => `"${c}"`).join(', ')}]`,
       `- "task": a detailed, self-contained description`,
       `- "depends_on": array of indices (0-based) of prerequisite subtasks, or [] for parallel`,
       '',
-      'Example for a code change task:',
+      'Example:',
       '[',
-      '  {"agent":"researcher","task":"Find all files related to X, understand the current implementation patterns and dependencies","depends_on":[]},',
-      '  {"agent":"coder","task":"Implement Y based on the research findings. Modify files A, B, C as needed","depends_on":[0]},',
-      '  {"agent":"tester","task":"Write tests for the new Y feature and run the test suite to verify everything passes","depends_on":[1]},',
-      '  {"agent":"reviewer","task":"Review all code changes for quality, check for bugs, security issues, and ensure project conventions are followed","depends_on":[1]}',
+      '  {"capability":"backend","task":"Add /api/foo endpoint with validation","depends_on":[]},',
+      '  {"capability":"frontend","task":"Wire FooPage to consume /api/foo","depends_on":[0]},',
+      '  {"capability":"qa","task":"Add integration tests for /api/foo","depends_on":[0]},',
+      '  {"capability":"final-review","task":"Final review of all changes","depends_on":[0,1,2]}',
       ']',
     ].join('\n')
 
-    const planResult = await runClaude(planPrompt, 'You are a task planner. Output ONLY a valid JSON array. No markdown fences, no explanation, no tool use. Just the JSON.', coordinatorId, true)
+    // The planner Claude process MUST occupy a scheduler slot and respect
+    // the global cap (blocker 7). Enqueue a synthetic planning subtask
+    // bound to the coordinator profile, then release it when planning
+    // completes (success or error).
+    const plannerSubtaskId = `plan-${taskId}`
+    scheduler.enqueue({
+      id: plannerSubtaskId,
+      taskId,
+      capability: 'planning',
+      description: `Plan: ${taskDesc}`,
+      profileId: 'queen-dispatcher',
+      priority: (task.priority as Priority | undefined) ?? 'normal',
+    })
+    let planResult: string
+    let plannerReleased = false
+    const releasePlanner = (reason: 'close' | 'error') => {
+      if (plannerReleased) return
+      plannerReleased = true
+      scheduler.release(plannerSubtaskId, reason)
+    }
+    try {
+      // Block until the planner slot is granted (may queue under cap).
+      await scheduler.awaitDispatch(plannerSubtaskId)
+      planResult = await runClaude(planPrompt, 'You are a task planner. Output ONLY a valid JSON array. No markdown fences, no explanation, no tool use. Just the JSON.', coordinatorId, true)
+      releasePlanner('close')
+    } catch (err) {
+      releasePlanner('error')
+      throw err
+    }
 
     // Parse the plan
     const jsonMatch = planResult.match(/\[[\s\S]*\]/)
-    let subtasks: Array<{ agent: string; task: string; depends_on: number[] }> = []
+    let subtasks: Array<{ capability?: string; agent?: string; task: string; depends_on: number[] }> = []
     if (jsonMatch) {
       try { subtasks = JSON.parse(jsonMatch[0]) } catch (e) {
         console.warn('[pipeline] Failed to parse subtask plan JSON:', e instanceof Error ? e.message : String(e))
       }
     }
 
+    // Backwards compat: also accept old "agent" field by treating it as a hint.
+    // Normalise into a `capability` key for scheduler routing.
+    subtasks = subtasks.map(st => ({
+      ...st,
+      capability: st.capability || st.agent || 'backend',
+    }))
+
+    // Detect planner invalid → deterministic chain fallback (blocker 12).
+    // WRITE tasks: implementation -> tests -> final-review
+    // READ-ONLY tasks: analysis -> final-review
+    const plannerInvalid = subtasks.length === 0
+    const isReadOnly = /\bread[- ]?only\b/i.test(taskDesc)
+
+    function buildDeterministicFallback(): Array<{ capability: string; task: string; depends_on: number[] }> {
+      if (isReadOnly) {
+        return [
+          { capability: 'research', task: `Analyze the following request and produce findings: ${taskDesc}`, depends_on: [] },
+          { capability: 'final-review', task: 'FINAL REVIEW: Synthesize the analysis into a complete deliverable.', depends_on: [0] },
+        ]
+      }
+      return [
+        { capability: 'backend', task: `Implement the requested change: ${taskDesc}`, depends_on: [] },
+        { capability: 'qa', task: 'Add or update tests covering the implementation and run the test suite.', depends_on: [0] },
+        { capability: 'final-review', task: 'FINAL REVIEW: Synthesize implementation + test results into a final deliverable.', depends_on: [0, 1] },
+      ]
+    }
+
+    if (plannerInvalid) {
+      subtasks = buildDeterministicFallback()
+      broadcast('task:output', { id: taskId, workflowId, type: 'text', content: '[Fallback] Planner JSON invalid, dispatching deterministic chain' })
+    }
+
+    // Enforce exactly-one-final-review, last in the array, depends_on every prior subtask (blocker 11).
+      // Strip planner-provided terminal reviewer aliases, then append one canonical final-review.
+      subtasks = stripTerminalReviewerAliases(subtasks)
     if (subtasks.length > 0) {
-      const finalReviewerDependencies = subtasks.map((_, index) => index)
+      const priorIndices = subtasks.map((_, index) => index)
       subtasks.push({
-        agent: 'reviewer',
+        capability: 'final-review',
         task: [
           'FINAL REVIEW: Review every prior subtask result against the original task.',
           `Original task: ${taskDesc}`,
@@ -1332,120 +1419,261 @@ async function launchSwarmPipeline(
           'For plans and reports, include the complete requested content, not only a verdict.',
           'Keep the final answer at or below 10000 characters. Never push, merge, or deploy.',
         ].join('\n'),
-        depends_on: finalReviewerDependencies,
+        depends_on: priorIndices,
       })
     }
+
+    // Pre-assign stable ids so cross-task references can route through the scheduler.
+    subtasks = subtasks.map((st, i) => ({
+      ...st,
+      _id: `sub-${taskId}-${i}`,
+    }))
 
     const planStep = wf.steps.find(s => s.id === 'step-plan')
     if (planStep) planStep.status = 'completed'
     broadcast('workflow:updated', wf)
 
-    if (subtasks.length === 0) {
-      // Fallback: if coordinator couldn't plan, just run the whole task with a coder
-      broadcast('task:output', { id: taskId, workflowId, type: 'text', content: '[Fallback] Could not parse plan, running with single coder agent' })
-      const coder = workers.find(w => w.type === 'coder') || workers[0]
-      if (coder) {
-        wf.steps.push({ id: 'step-exec', name: 'Execute', status: 'running', agent: coder.name, detail: taskDesc.slice(0, 80) })
-        broadcast('workflow:updated', wf)
-        const result = await runClaude(taskDesc, `You are a ${coder.type} agent. Complete this task thoroughly.`, coder.id)
-        const execStep = wf.steps.find(s => s.id === 'step-exec')
-        if (execStep) execStep.status = 'completed'
-        task.result = result.slice(0, 12000) || 'Completed'
-      }
-    } else {
-      // ── PHASE 2: Execute subtasks respecting dependencies ──
-      broadcast('task:output', { id: taskId, workflowId, type: 'text', content: `[Phase 2] Executing ${subtasks.length} subtasks across agents...` })
+    if (plannerInvalid) {
+      // Deterministic fallback path: still saves the full TaskRecord.agentResults (blocker 13).
+      broadcast('task:output', { id: taskId, workflowId, type: 'text', content: '[Phase 2] Executing deterministic fallback chain...' })
       const results: string[] = new Array(subtasks.length).fill('')
-      const completed = new Set<number>()
+      const fallbackSteps: Array<{ id: string; name: string; status: string; agent?: string; detail?: string }> = []
+      const fallbackStatuses: Array<'pending' | 'completed' | 'failed' | 'cancelled'> =
+        new Array(subtasks.length).fill('pending')
 
-      // Execute in waves: each wave runs all subtasks whose dependencies are met
-      while (completed.size < subtasks.length) {
-        const ready = subtasks.map((st, i) => ({ ...st, idx: i }))
-          .filter(st => !completed.has(st.idx) && st.depends_on.every(d => completed.has(d)))
+      for (let i = 0; i < subtasks.length; i++) {
+        const st = subtasks[i] as any
+        const depIds = (st.depends_on || []).map((d: number) => (subtasks[d] as any)._id).filter(Boolean)
+        scheduler.enqueue({
+          id: st._id,
+          taskId,
+          capability: st.capability || 'backend',
+          description: st.task,
+          dependsOn: depIds,
+          priority: (task.priority as Priority | undefined) ?? 'normal',
+        })
+      }
 
-        if (ready.length === 0) {
-          broadcast('task:output', { id: taskId, workflowId, type: 'text', content: '[Error] Circular dependency detected, aborting remaining subtasks' })
+      let fallbackFailed = false
+      for (let i = 0; i < subtasks.length; i++) {
+        if (fallbackFailed) break
+        const st = subtasks[i] as any
+        const subtaskId: string = st._id
+        try {
+          const dispatched = await scheduler.awaitDispatch(subtaskId)
+          const profile = AGENT_PROFILES.find(p => p.profileId === dispatched.profileId)
+          const isFinalReviewer = dispatched.profileId === 'reviewer' && i === subtasks.length - 1
+          const depContext = st.depends_on.length > 0
+            ? '\n\nPrevious results:\n' + st.depends_on.map((d: number) => `[${subtasks[d].capability}]: ${isFinalReviewer ? results[d] : (results[d] || '').slice(0, 500)}`).join('\n')
+            : ''
+          const sysPrompt = profile?.systemPrompt || `You are a development agent. Complete this task thoroughly.`
+          const agentPrompt = `Complete this task:\n\n${st.task}${depContext}`
+          const stepId = `step-${i + 1}`
+          fallbackSteps.push({ id: stepId, name: `${profile?.name || 'Agent'}: ${st.task.slice(0, 40)}`, status: 'running', agent: profile?.name, detail: st.task.slice(0, 80) })
+          wf.steps.push(fallbackSteps[fallbackSteps.length - 1])
+          broadcast('workflow:updated', wf)
+          const result = await runClaude(agentPrompt, sysPrompt, dispatched.agentId, false)
+          results[i] = result
+          const step = wf.steps.find(s => s.id === stepId)
+          if (step) step.status = 'completed'
+          scheduler.complete(subtaskId, result)
+          fallbackStatuses[i] = 'completed'
+          await storeHiveMindMemory(`task-${taskId}-${st.capability}-${i}`, (result || '').slice(0, 300))
+        } catch (err) {
+          results[i] = `Error: ${err instanceof Error ? err.message : String(err)}`
+          // Cancel the entire chain so held deps surface typed errors.
+          scheduler.cancelTask(taskId)
+          fallbackStatuses[i] = 'failed'
+          fallbackFailed = true
           break
         }
-
-          // Run ready subtasks with bounded parallelism.
-          const maxConcurrent = Math.max(1, Math.min(2, Number(process.env.RUFLO_PIPELINE_MAX_CONCURRENT || 2) || 2))
-          for (let batchStart = 0; batchStart < ready.length; batchStart += maxConcurrent) {
-            const batch = ready.slice(batchStart, batchStart + maxConcurrent)
-            const wave = batch.map(async (st) => {
-          const agent = workers.find(w => w.type === st.agent) || workers[0]
-          if (!agent) return
-
-          const stepId = `step-${st.idx + 1}`
-          wf.steps.push({ id: stepId, name: `${st.agent}: ${st.task.slice(0, 40)}`, status: 'running', agent: agent.name, detail: st.task.slice(0, 80) })
-          broadcast('workflow:updated', wf)
-          broadcast('task:output', { id: taskId, workflowId, type: 'text', content: `  [${agent.name}] ${st.task.slice(0, 100)}` })
-
-          // Build context from dependencies
-          const isFinalReviewer = st.agent === 'reviewer' && st.idx === subtasks.length - 1
-          const depContext = st.depends_on.length > 0
-            ? '\n\nPrevious results:\n' + st.depends_on.map(d => `[${subtasks[d].agent}]: ${isFinalReviewer ? results[d] : results[d].slice(0, 500)}`).join('\n')
-            : ''
-
-          const roleSystemPrompts: Record<string, string> = {
-            researcher: 'You are a researcher agent. Your job is to explore the codebase, find relevant files, read code, and report your findings clearly. Use Read, Grep, Glob tools. Do NOT modify any files.',
-            coder: 'You are a full-stack implementation engineer. Inspect and modify application code, create files, and run builds and tests. If the task explicitly says READ-ONLY, do not modify files. Never push, merge, or deploy unless explicitly authorized.',
-            tester: 'You are a tester agent. Write and run tests when implementation is allowed. For READ-ONLY or audit tasks, do not modify files; inspect and run existing tests only. Report results clearly.',
-            reviewer: 'You are a code reviewer agent. Review the code changes for bugs, security issues, style problems, and adherence to best practices. Report issues found.',
-            analyst: 'You are an analyst agent. Analyze requirements and produce clear technical specifications.',
-            architect: 'You are an architect agent. Design system architecture, define patterns, interfaces and data flow.',
-            'swarm-specialist': 'You are a DevOps implementation engineer. Inspect and modify infrastructure, service units, CI, configuration, and operational scripts. Build and verify before restart. Never push, merge, deploy, or expose secrets unless explicitly authorized. Remain read-only when the task says READ-ONLY.',
-            'security-architect': 'You are a security architect. Inspect authentication, authorization, tenant isolation, secrets, dependency risks, and fail-closed behavior. Remain read-only unless implementation is explicitly authorized.',
-          }
-          const agentPrompt = `Complete this task:\n\n${st.task}${depContext}`
-          const sysPrompt = roleSystemPrompts[st.agent] || `You are a ${st.agent} agent in a development swarm. Do your assigned work precisely. Do not ask questions, just execute.`
-
-          try {
-            results[st.idx] = await runClaude(agentPrompt, sysPrompt, agent.id)
-            const step = wf.steps.find(s => s.id === stepId)
-            if (step) step.status = 'completed'
-            // Store agent findings in hive mind shared memory
-            // Store subtask result to hive mind
-            await storeHiveMindMemory(
-              `task-${taskId}-${st.agent}-${st.idx}`,
-              results[st.idx].slice(0, 300),
-            )
-          } catch (err) {
-            results[st.idx] = `Error: ${err instanceof Error ? err.message : String(err)}`
-            const step = wf.steps.find(s => s.id === stepId)
-            if (step) step.status = 'failed'
-          }
-          completed.add(st.idx)
-          broadcast('workflow:updated', wf)
-        })
-
-            await Promise.all(wave)
-          }
+        broadcast('workflow:updated', wf)
       }
 
       task.agentResults = subtasks.map((st, index) => ({
         index,
-        agent: st.agent,
+        agent: (st as any).capability,
         task: st.task,
         result: results[index] || '',
       }))
+      const finalIdx = subtasks.length - 1
+      task.result = (results[finalIdx] || [...results].reverse().find(Boolean) || 'Pipeline completed').slice(0, 12000)
+      task.subtaskStatuses = fallbackStatuses
+    } else {
+      // Global work-conserving scheduler picks the next free agent for each
+      // ready subtask; the per-subtask coroutine acquires a slot, runs, and
+      // frees the slot on close/error/cancel/timeout.
+      broadcast('task:output', { id: taskId, workflowId, type: 'text', content: `[Phase 2] Executing ${subtasks.length} subtasks across agents...` })
+      const results: string[] = new Array(subtasks.length).fill('')
+      const statuses: Array<'pending' | 'completed' | 'failed' | 'cancelled'> =
+        new Array(subtasks.length).fill('pending')
+      const idToIndex = new Map<string, number>()
+      subtasks.forEach((st, i) => { if ((st as any)._id) idToIndex.set((st as any)._id, i) })
 
-      const finalReviewerIndex = subtasks.map(st => st.agent).lastIndexOf('reviewer')
-        task.result = (results[finalReviewerIndex] || [...results].reverse().find(Boolean) || 'Pipeline completed').slice(0, 12000)
+      // Enqueue every subtask with the scheduler (one shared queue);
+      // dependent subtasks stay held until their prerequisites complete.
+      for (let i = 0; i < subtasks.length; i++) {
+        const st = subtasks[i] as any
+        const depIds = (st.depends_on || []).map((d: number) => (subtasks[d] as any)._id).filter(Boolean)
+        scheduler.enqueue({
+          id: st._id,
+          taskId,
+          capability: st.capability || 'backend',
+          description: st.task,
+          dependsOn: depIds,
+          priority: (task.priority as Priority | undefined) ?? 'normal', // blocker 6: propagate parent priority
+        })
+      }
+
+      // Drive every subtask via scheduler-driven loops: each task awaits the
+      // scheduler to assign it to a free agent, runs Claude, then completes
+      // (frees the slot + lease exactly once).
+      const slotPromises = subtasks.map(async (rawSt, i) => {
+        const st = rawSt as any
+        const subtaskId: string = st._id
+
+        let profileMatch: AgentProfile | undefined
+        for (const p of AGENT_PROFILES) {
+          if (p.capabilities.includes(st.capability)) { profileMatch = p; break }
+        }
+        if (!profileMatch) {
+          results[i] = `Error: no profile exposes capability "${st.capability}"`
+          scheduler.fail(subtaskId, new Error(results[i]))
+          statuses[i] = 'failed'
+          return
+        }
+
+        let agentId: string
+        let dispatchedProfileId: string
+        try {
+          const dispatched = await scheduler.awaitDispatch(subtaskId)
+          agentId = dispatched.agentId
+          dispatchedProfileId = dispatched.profileId
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err)
+          results[i] = `Error: scheduler dispatch failed for "${st.capability}": ${reason}`
+          // If we were rejected because the subtask was cancelled (explicit,
+          // task-cancelled, dep-cancelled, dep-failed, dispatch-timeout,
+          // scheduled-shutdown) record it; otherwise cancel so held deps don't
+          // deadlock.
+          const terminalReason = scheduler.getTerminalReason(subtaskId)
+          if (terminalReason === 'dispatch-timeout') {
+            statuses[i] = 'cancelled'
+          } else if (terminalReason === 'scheduled-shutdown') {
+            statuses[i] = 'cancelled'
+            return // don't cancel again
+          } else {
+            scheduler.cancel(subtaskId)
+            statuses[i] = 'cancelled'
+          }
+          return
+        }
+
+        // Use the ACTUALLY DISPATCHED profile (blocker 9) — never assume the
+        // first match. Integration Engineer must NOT receive Backend Engineer 1's prompt.
+        const resolvedProfile: AgentProfile =
+          AGENT_PROFILES.find(p => p.profileId === dispatchedProfileId) || profileMatch
+        const agentRecord = Array.from(agentRegistry.values()).find(a => a.id === agentId)
+        const stepId = `step-${i + 1}`
+        wf.steps.push({ id: stepId, name: `${resolvedProfile.name}: ${st.task.slice(0, 40)}`, status: 'running', agent: agentRecord?.name || resolvedProfile.name || agentId, detail: st.task.slice(0, 80) })
+        broadcast('workflow:updated', wf)
+        broadcast('task:output', { id: taskId, workflowId, type: 'text', content: `  [${agentRecord?.name || resolvedProfile.name || agentId}] ${st.task.slice(0, 100)}` })
+
+        // Final reviewer gets full prior results; intermediates see 500-char summaries.
+        const isFinalReviewer = resolvedProfile.profileId === 'reviewer' && i === subtasks.length - 1
+        const depContext = st.depends_on.length > 0
+          ? '\n\nPrevious results:\n' + st.depends_on.map((d: number) => `[${subtasks[d].capability}]: ${isFinalReviewer ? results[d] : (results[d] || '').slice(0, 500)}`).join('\n')
+          : ''
+
+        const sysPrompt = resolvedProfile.systemPrompt
+        const agentPrompt = `Complete this task:\n\n${st.task}${depContext}`
+
+        try {
+          results[i] = await runClaude(agentPrompt, sysPrompt, agentId, false)
+          const step = wf.steps.find(s => s.id === stepId)
+          if (step) step.status = 'completed'
+          await storeHiveMindMemory(
+            `task-${taskId}-${st.capability}-${i}`,
+            (results[i] || '').slice(0, 300),
+          )
+          // Notify scheduler of completion (frees slot + lease exactly once).
+          scheduler.complete(subtaskId, results[i] || '')
+          statuses[i] = 'completed'
+        } catch (err) {
+          results[i] = `Error: ${err instanceof Error ? err.message : String(err)}`
+          const step = wf.steps.find(s => s.id === stepId)
+          if (step) step.status = 'failed'
+          // If a dependency or the parent task cancelled this run, record
+          // 'cancelled' instead of 'failed'. Otherwise it's a true failure.
+          const terminalReason = scheduler.getTerminalReason(subtaskId)
+          if (terminalReason === 'task-cancelled' || terminalReason === 'dependency-cancelled' || terminalReason === 'scheduled-shutdown' || terminalReason === 'dispatch-timeout') {
+            scheduler.cancel(subtaskId)
+            statuses[i] = 'cancelled'
+          } else {
+            scheduler.fail(subtaskId, err instanceof Error ? err : new Error(String(err)))
+            statuses[i] = 'failed'
+          }
+        }
+        broadcast('workflow:updated', wf)
+      })
+
+      await Promise.all(slotPromises)
+
+      task.agentResults = subtasks.map((st, index) => ({
+        index,
+        agent: (st as any).capability,
+        task: st.task,
+        result: results[index] || '',
+      }))
+      task.subtaskStatuses = statuses
+
+      // Mandatory Final Reviewer — required to remain last in the agentResults list.
+      const finalIndex = subtasks.findIndex(s => s.capability === 'final-review' || s.capability === 'review')
+      const finalIdx = finalIndex >= 0 ? finalIndex : subtasks.length - 1
+      task.result = (results[finalIdx] || [...results].reverse().find(Boolean) || 'Pipeline completed').slice(0, 12000)
     }
 
-    // ── PHASE 3: Mark complete ──
-    task.status = 'completed'
-    task.completedAt = new Date().toISOString()
-    wf.status = 'completed'
-    wf.completedAt = task.completedAt
-    wf.result = task.result
+    // ── PHASE 3: Mark complete (fail-closed) ──
+    // Never overwrite an already-cancelled task — the pipeline must respect
+    // the user's cancel request even if all subtasks reported success.
+    if (task.status === 'cancelled') {
+      // Cancelled tasks keep their terminal state; don't mark them completed.
+    } else {
+      // Fail-closed: if any required worker failed or was cancelled, the
+      // parent must not reach `completed`. Preserve the most informative
+      // terminal status (cancelled wins over failed for explicit cancels).
+      const subtaskStatuses: ReadonlyArray<string> = (task.subtaskStatuses as ReadonlyArray<string>) || []
+      const anyFailed = subtaskStatuses.some(s => s === 'failed')
+      const anyCancelled = subtaskStatuses.some(s => s === 'cancelled')
+      const allSettled = subtaskStatuses.every(s => s === 'completed')
+
+      if (anyCancelled) {
+        task.status = 'cancelled'
+        task.completedAt = new Date().toISOString()
+        task.result = (task.result ? task.result + '\n' : '') + 'Cancelled: at least one required worker cancelled.'
+        wf.status = 'cancelled'
+        wf.completedAt = task.completedAt
+      } else if (anyFailed || !allSettled) {
+        task.status = 'failed'
+        task.completedAt = new Date().toISOString()
+        task.result = (task.result ? task.result + '\n' : '') + 'Pipeline failed: at least one required worker did not complete.'
+        wf.status = 'failed'
+        wf.completedAt = task.completedAt
+        wf.result = task.result
+      } else {
+        task.status = 'completed'
+        task.completedAt = new Date().toISOString()
+        wf.status = 'completed'
+        wf.completedAt = task.completedAt
+        wf.result = task.result
+      }
+    }
     // Persist final result to hive mind shared memory
     // Persist final result to hive mind
     await storeHiveMindMemory(`task-result-${taskId}`, `${title}: ${(task.result || '').slice(0, 500)}`)
     broadcast('task:updated', { ...task, id: taskId })
     broadcast('workflow:updated', wf)
-    broadcast('task:output', { id: taskId, workflowId, type: 'done', code: 0 })
+    broadcast('task:output', { id: taskId, workflowId, type: 'done', code: task.status === 'completed' ? 0 : 1 })
     if (coordinatorId) {
       const act = agentActivity.get(coordinatorId)
       updateAgentActivity(coordinatorId, { status: 'idle', currentTask: undefined, currentAction: undefined, tasksCompleted: (act?.tasksCompleted || 0) + 1 })
@@ -1453,9 +1681,21 @@ async function launchSwarmPipeline(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     console.error(`[TASK ${taskId}] Pipeline failed: ${msg}`)
-    task.status = 'failed'
-    task.result = `Pipeline error: ${msg.slice(0, 1000)}`
-    wf.status = 'failed'
+    // Outer-catch safety: cancel every scheduler subtask for this task so
+    // no new dispatches occur, but DO NOT enqueue any new subtasks.
+    try {
+      const outerScheduler = getGlobalScheduler()
+      outerScheduler.cancelTask(taskId)
+    } catch { /* scheduler may already be torn down */ }
+
+    if (task.status === 'cancelled') {
+      // Don't overwrite a cancellation imposed by an explicit user action.
+      task.result = (task.result ? task.result + '\n' : '') + `Pipeline aborted after cancel: ${msg.slice(0, 500)}`
+    } else {
+      task.status = 'failed'
+      task.result = `Pipeline error: ${msg.slice(0, 1000)}`
+      wf.status = 'failed'
+    }
     broadcast('task:updated', { ...task, id: taskId })
     broadcast('workflow:updated', wf)
     // Release all agents
@@ -1666,6 +1906,18 @@ function releaseAllBusyAgents(taskId: string, success: boolean): void {
 }
 
 // ── MODE 2: claude -p (fallback when no swarm active) ──────────────────
+//
+// Failure-isolated launch path:
+//   1. Register synthetic launcher agent + enqueue scheduler slot.
+//   2. **AWAIT** scheduler.awaitDispatch BEFORE spawning the process.
+//      - Dispatch rejection → NO spawn happens.
+//      - Cancel-while-queued → NO spawn happens (cancelOne removed the pending entry).
+//   3. Spawn the Claude process, attach handlers, return control to the
+//      caller while it runs in the background.
+//   4. Release the lease + unregister the synthetic agent EXACTLY ONCE,
+//      from a single shared `releaseOnce()` helper called by every exit
+//      path (close, error, dispatch rejection).
+//   5. `--model` is sourced from RUFLO_CLAUDE_MODEL || 'opus' — every call.
 function launchViaClaude(
   taskId: string, task: TaskRecord, taskDesc: string, title: string,
   wf: WorkflowRecord, workflowId: string,
@@ -1684,124 +1936,215 @@ function launchViaClaude(
   const swarmPrompt = buildSwarmPrompt(task, taskId)
   const sessionUUID = crypto.randomUUID()
   task.sessionUUID = sessionUUID
+
+  // blocker 8: every spawn(claudePath) MUST include --model and respect the
+  // global scheduler cap. We register a synthetic `launcher` agent for this
+  // process so it occupies a slot and a profile lock until completion.
+  const scheduler = getGlobalScheduler()
+  const launcherAgentId = `claude-launcher-${taskId}`
+  const launchSubtaskId = `launch-${taskId}`
+  scheduler.registerAgents([{ profileId: 'launcher', agentId: launcherAgentId }])
+  scheduler.enqueue({
+    id: launchSubtaskId,
+    taskId,
+    capability: 'launcher',
+    description: taskDesc,
+    profileId: 'launcher',
+    priority: (task.priority as Priority | undefined) ?? 'normal',
+  })
+
+  // Single shared cleanup — guaranteed exactly-once per exit path.
+  let released = false
+  const releaseOnce = (mode: 'complete' | 'fail' | 'cancel', payload?: { result?: string; error?: Error }) => {
+    if (released) return
+    released = true
+    try {
+      if (mode === 'complete') {
+        scheduler.complete(launchSubtaskId, payload?.result || 'done')
+      } else if (mode === 'fail') {
+        scheduler.fail(launchSubtaskId, payload?.error || new Error('launch failed'))
+      } else {
+        // cancel: caller already triggered cancellation via cancelTask/awaitDispatch
+        // (we may be here because we never actually held a lease — release is no-op)
+        if (!scheduler.isSubtaskActive(launchSubtaskId) && !scheduler.isSubtaskCancelled(launchSubtaskId)) {
+          scheduler.release(launchSubtaskId, 'cancel')
+        }
+      }
+    } catch { /* scheduler may already be torn down */ }
+    try { scheduler.unregisterAgent(launcherAgentId) } catch { /* ignore */ }
+  }
+
+  const claudeModel = process.env.RUFLO_CLAUDE_MODEL || 'opus'
   const claudeArgs = [
     '-p', taskDesc,
     '--output-format', 'stream-json',
     '--verbose',
+    '--model', claudeModel,
     ...(SKIP_PERMISSIONS ? ['--dangerously-skip-permissions'] : []),
     '--session-id', sessionUUID,
     ...mcpArgs,
     '--append-system-prompt', swarmPrompt,
   ]
-  const proc = spawn(claudePath, claudeArgs, { cwd: task.cwd || process.cwd(), env: cleanEnv, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
 
-  startMonitoring(sessionUUID, taskId, broadcast)
-  runningProcesses.set(taskId, proc)
-  trackProcessActivity(taskId)
-  let fullOutput = ''
-  let stderrOutput = ''
+  // Wait for the scheduler to grant a slot BEFORE we spawn. If dispatch
+  // rejects (cancelled, task-cancelled, timed-out, shutdown, prerequisite
+  // failure) we MUST NOT spawn a process. Release the synthetic agent and
+  // mark the task failed.
+  scheduler.awaitDispatch(launchSubtaskId).then(() => {
+    const proc = spawn(claudePath, claudeArgs, { cwd: task.cwd || process.cwd(), env: cleanEnv, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
 
-  console.log(`[TASK ${taskId}] Launching claude -p "${taskDesc.slice(0, 80)}"`)
-
-  const assignedAgent = task.assignedTo || 'swarm'
-  const coordinatorId = Array.from(agentRegistry.values()).find(a => a.type === 'coordinator')?.id
-  const workingAgentId = assignedAgent === 'swarm' ? (coordinatorId || 'coordinator') : assignedAgent
-  updateAgentActivity(workingAgentId, { status: 'working', currentTask: taskId, currentAction: `Executing: ${title.slice(0, 50)}` })
-
-  proc.stdout?.on('data', (chunk: Buffer) => {
+    startMonitoring(sessionUUID, taskId, broadcast)
+    runningProcesses.set(taskId, proc)
     trackProcessActivity(taskId)
-    const text = chunk.toString()
-    const lines = text.split('\n').filter(Boolean)
-    for (const line of lines) {
-      try {
-        const evt = JSON.parse(line)
-        if (evt.type === 'assistant' && evt.message?.content) {
-          for (const block of evt.message.content) {
-            if (block.type === 'text') {
-              fullOutput += block.text
-              broadcast('task:output', { id: taskId, workflowId, type: 'text', content: block.text.slice(0, 300) })
-            } else if (block.type === 'tool_use') {
-              const toolInfo = `${block.name}: ${JSON.stringify(block.input).slice(0, 200)}`
-              fullOutput += `\n[tool] ${toolInfo}\n`
-              const stepId = `step-${wf.steps.length + 1}`
-              const inputSummary = block.input?.file_path || block.input?.command?.slice(0, 60) || block.input?.pattern || ''
-              wf.steps.push({
-                id: stepId, name: block.name, status: 'running',
-                agent: task.assignedTo || 'claude', detail: inputSummary,
-              })
-              broadcast('workflow:updated', wf)
-              broadcast('task:output', { id: taskId, workflowId, type: 'tool', tool: block.name, input: JSON.stringify(block.input).slice(0, 200) })
-              updateAgentActivity(workingAgentId, { status: 'working', currentTask: taskId, currentAction: `${block.name}: ${inputSummary.slice(0, 60)}` })
-              if (block.name === 'Agent' && block.input?.subagent_type) {
-                const matchedAgent = findSwarmAgentForType(block.input.subagent_type)
-                if (matchedAgent) {
-                  updateAgentActivity(matchedAgent.id, {
-                    status: 'working', currentTask: taskId,
-                    currentAction: `Subagent: ${(block.input.description || block.input.subagent_type).slice(0, 60)}`,
-                  })
+    let fullOutput = ''
+    let stderrOutput = ''
+
+    console.log(`[TASK ${taskId}] Launching claude -p "${taskDesc.slice(0, 80)}"`)
+
+    const assignedAgent = task.assignedTo || 'swarm'
+    const coordinatorId = Array.from(agentRegistry.values()).find(a => a.type === 'coordinator')?.id
+    const workingAgentId = assignedAgent === 'swarm' ? (coordinatorId || 'coordinator') : assignedAgent
+    updateAgentActivity(workingAgentId, { status: 'working', currentTask: taskId, currentAction: `Executing: ${title.slice(0, 50)}` })
+
+    proc.stdout?.on('data', (chunk: Buffer) => {
+      trackProcessActivity(taskId)
+      const text = chunk.toString()
+      const lines = text.split('\n').filter(Boolean)
+      for (const line of lines) {
+        try {
+          const evt = JSON.parse(line)
+          if (evt.type === 'assistant' && evt.message?.content) {
+            for (const block of evt.message.content) {
+              if (block.type === 'text') {
+                fullOutput += block.text
+                broadcast('task:output', { id: taskId, workflowId, type: 'text', content: block.text.slice(0, 300) })
+              } else if (block.type === 'tool_use') {
+                const toolInfo = `${block.name}: ${JSON.stringify(block.input).slice(0, 200)}`
+                fullOutput += `\n[tool] ${toolInfo}\n`
+                const stepId = `step-${wf.steps.length + 1}`
+                const inputSummary = block.input?.file_path || block.input?.command?.slice(0, 60) || block.input?.pattern || ''
+                wf.steps.push({
+                  id: stepId, name: block.name, status: 'running',
+                  agent: task.assignedTo || 'claude', detail: inputSummary,
+                })
+                broadcast('workflow:updated', wf)
+                broadcast('task:output', { id: taskId, workflowId, type: 'tool', tool: block.name, input: JSON.stringify(block.input).slice(0, 200) })
+                updateAgentActivity(workingAgentId, { status: 'working', currentTask: taskId, currentAction: `${block.name}: ${inputSummary.slice(0, 60)}` })
+                if (block.name === 'Agent' && block.input?.subagent_type) {
+                  const matchedAgent = findSwarmAgentForType(block.input.subagent_type)
+                  if (matchedAgent) {
+                    updateAgentActivity(matchedAgent.id, {
+                      status: 'working', currentTask: taskId,
+                      currentAction: `Subagent: ${(block.input.description || block.input.subagent_type).slice(0, 60)}`,
+                    })
+                  }
                 }
               }
             }
+          } else if (evt.type === 'tool_result' || (evt.type === 'user' && evt.message?.content)) {
+            const lastRunning = [...wf.steps].reverse().find(s => s.status === 'running')
+            if (lastRunning) { lastRunning.status = 'completed'; broadcast('workflow:updated', wf) }
+          } else if (evt.type === 'result') {
+            wf.steps.forEach(s => { if (s.status === 'running') s.status = 'completed' })
+            fullOutput = evt.result || fullOutput
+            broadcast('task:output', { id: taskId, workflowId, type: 'text', content: 'Task completed' })
           }
-        } else if (evt.type === 'tool_result' || (evt.type === 'user' && evt.message?.content)) {
-          const lastRunning = [...wf.steps].reverse().find(s => s.status === 'running')
-          if (lastRunning) { lastRunning.status = 'completed'; broadcast('workflow:updated', wf) }
-        } else if (evt.type === 'result') {
-          wf.steps.forEach(s => { if (s.status === 'running') s.status = 'completed' })
-          fullOutput = evt.result || fullOutput
-          broadcast('task:output', { id: taskId, workflowId, type: 'text', content: 'Task completed' })
+        } catch {
+          fullOutput += line + '\n'
+          broadcast('task:output', { id: taskId, workflowId, type: 'raw', content: line.slice(0, 300) })
         }
-      } catch {
-        fullOutput += line + '\n'
-        broadcast('task:output', { id: taskId, workflowId, type: 'raw', content: line.slice(0, 300) })
       }
-    }
-  })
+    })
 
-  proc.stderr?.on('data', (chunk: Buffer) => {
-    const text = chunk.toString().trim()
-    if (text) {
-      stderrOutput += text + '\n'
-      console.error(`[TASK ${taskId}] stderr: ${text}`)
-      broadcast('task:output', { id: taskId, workflowId, type: 'stderr', content: text.slice(0, 300) })
-    }
-  })
+    proc.stderr?.on('data', (chunk: Buffer) => {
+      const text = chunk.toString().trim()
+      if (text) {
+        stderrOutput += text + '\n'
+        console.error(`[TASK ${taskId}] stderr: ${text}`)
+        broadcast('task:output', { id: taskId, workflowId, type: 'stderr', content: text.slice(0, 300) })
+      }
+    })
 
-  proc.on('close', (code) => {
-    cleanupProcess(taskId)
-    stopMonitoring(sessionUUID)
-    const combined = (fullOutput + '\n' + stderrOutput).trim()
-    console.log(`[TASK ${taskId}] Exited with code ${code}. Output length: ${combined.length}`)
-    if (code === 0) {
-      task.status = 'completed'
+    proc.on('close', (code) => {
+      cleanupProcess(taskId)
+      stopMonitoring(sessionUUID)
+      // Release scheduler slot for the launcher process (blocker 8).
+        const result = fullOutput.slice(0, 2000) || 'done'
+        const combined = (fullOutput + '\n' + stderrOutput).trim()
+        if (code === 0) {
+          releaseOnce('complete', { result })
+        } else {
+          releaseOnce('fail', { error: new Error(combined || `Process exited with code ${code}`) })
+        }
+        console.log(`[TASK ${taskId}] Exited with code ${code}. Output length: ${combined.length}`)
+        if (task.status === 'cancelled') {
+          wf.status = 'cancelled'
+          wf.completedAt = task.completedAt || new Date().toISOString()
+        } else if (code === 0) {
+          task.status = 'completed'
+          task.completedAt = new Date().toISOString()
+          task.result = fullOutput.slice(0, 2000) || 'Task completed'
+          wf.status = 'completed'
+          wf.completedAt = task.completedAt
+          wf.result = task.result
+        } else {
+          task.status = 'failed'
+          task.result = combined.slice(0, 2000) || `Process exited with code ${code}`
+          wf.status = 'failed'
+          wf.result = task.result
+        }
+        broadcast('task:updated', { ...task, id: taskId })
+        broadcast('workflow:updated', wf)
+        broadcast('task:output', { id: taskId, workflowId, type: 'done', code: task.status === 'completed' ? 0 : 1 })
+        releaseAllBusyAgents(taskId, task.status === 'completed')
+        const activity = agentActivity.get(workingAgentId)
+        const completed = (activity?.tasksCompleted || 0) + (task.status === 'completed' ? 1 : 0)
+        const errors = (activity?.errors || 0) + (task.status === 'failed' ? 1 : 0)
+        updateAgentActivity(workingAgentId, { status: 'idle', currentTask: undefined, currentAction: undefined, tasksCompleted: completed, errors })
+    })
+
+      proc.on('error', (err) => {
+        cleanupProcess(taskId)
+        console.error(`[TASK ${taskId}] Process error: ${err.message}`)
+        releaseOnce('fail', { error: err })
+        if (task.status !== 'cancelled') {
+          task.status = 'failed'
+          task.result = `Process error: ${err.message}`
+          wf.status = 'failed'
+          wf.result = task.result
+        } else {
+          wf.status = 'cancelled'
+          wf.completedAt = task.completedAt || new Date().toISOString()
+        }
+        broadcast('task:updated', { ...task, id: taskId })
+        broadcast('workflow:updated', wf)
+      })
+  }).catch((err) => {
+    // Dispatch was rejected (cancelled / task-cancelled / dep-failed /
+    // dep-cancelled / dispatch-timeout / scheduled-shutdown / no-match).
+    // Per blocker 6 we MUST NOT spawn a process.
+    const reason = scheduler.getTerminalReason(launchSubtaskId)
+    const msg = err instanceof Error ? err.message : String(err)
+    console.warn(`[TASK ${taskId}] launchViaClaude dispatch rejected (${reason || 'unknown'}): ${msg}`)
+    releaseOnce('cancel')
+    // Don't overwrite an explicit user cancellation; otherwise mark failed.
+    if (task.status !== 'cancelled') {
+      task.status = (reason === 'task-cancelled' || reason === 'dependency-cancelled' || reason === 'scheduled-shutdown' || reason === 'dispatch-timeout')
+        ? 'cancelled'
+        : 'failed'
       task.completedAt = new Date().toISOString()
-      task.result = fullOutput.slice(0, 2000) || 'Task completed'
-      wf.status = 'completed'
-      wf.completedAt = task.completedAt
-      wf.result = task.result
-    } else {
-      task.status = 'failed'
-      task.result = combined.slice(0, 2000) || `Process exited with code ${code}`
-      wf.status = 'failed'
-      wf.result = task.result
+      task.result = `Dispatch rejected (${reason || 'unknown'}): ${msg.slice(0, 500)}`
+      if (task.status === 'failed') {
+        wf.status = 'failed'
+        wf.result = task.result
+      } else {
+        wf.status = 'cancelled'
+        wf.completedAt = task.completedAt
+      }
     }
     broadcast('task:updated', { ...task, id: taskId })
     broadcast('workflow:updated', wf)
-    broadcast('task:output', { id: taskId, workflowId, type: 'done', code })
-    releaseAllBusyAgents(taskId, code === 0)
-    const activity = agentActivity.get(workingAgentId)
-    const completed = (activity?.tasksCompleted || 0) + (code === 0 ? 1 : 0)
-    const errors = (activity?.errors || 0) + (code !== 0 ? 1 : 0)
-    updateAgentActivity(workingAgentId, { status: 'idle', currentTask: undefined, currentAction: undefined, tasksCompleted: completed, errors })
-  })
-
-  proc.on('error', (err) => {
-    cleanupProcess(taskId)
-    console.error(`[TASK ${taskId}] Process error: ${err.message}`)
-    task.status = 'failed'
-    task.result = `Process error: ${err.message}`
-    wf.status = 'failed'
-    broadcast('task:updated', { ...task, id: taskId })
+    broadcast('task:output', { id: taskId, workflowId, type: 'done', code: task.status === 'completed' ? 0 : 1 })
   })
 }
 
@@ -1819,10 +2162,14 @@ function swarmRoutes(): Router {
     lastSwarmId = idMatch?.[1] || `swarm-${Date.now()}`
     lastSwarmTopology = topology || 'hierarchical'
     lastSwarmStrategy = strategy || 'specialized'
-    lastSwarmMaxAgents = maxAgents || 8
+    lastSwarmMaxAgents = maxAgents || 10
     lastSwarmCreatedAt = new Date().toISOString()
     swarmShutdown = false
     allTerminatedBefore = null // Reset so new agents show up
+
+    // Reset the scheduler so stale agent IDs never linger across re-inits.
+    resetGlobalScheduler()
+    const scheduler = getGlobalScheduler()
 
     // Purge all existing zombie agents before spawning fresh ones
     const purged = await purgeAllCliAgents()
@@ -1831,17 +2178,10 @@ function swarmRoutes(): Router {
     // Start the orchestration daemon in background
     ensureDaemon().catch(() => {})
 
-    // Auto-spawn a default set of specialized agents for the swarm
-    const defaultAgents: Array<{ type: string; name: string }> = [
-      { type: 'coordinator', name: 'Queen Dispatcher' },
-      { type: 'researcher', name: 'Cartographer' },
-      { type: 'architect', name: 'System Architect' },
-      { type: 'coder', name: 'Full-stack Engineer' },
-      { type: 'swarm-specialist', name: 'DevOps Engineer' },
-      { type: 'security-architect', name: 'Security Auditor' },
-      { type: 'tester', name: 'QA Auditor' },
-      { type: 'reviewer', name: 'Final Reviewer' },
-    ]
+    // Auto-spawn the default 10-agent team from application-level profiles.
+    const defaultAgents: Array<{ type: string; name: string; profileId: string }> = AGENT_PROFILES.map(p => ({
+      type: p.type, name: p.name, profileId: p.profileId,
+    }))
     const spawnedAgents: Array<{ id: string; name: string; type: string; status: string; createdAt: string }> = []
     for (const ag of defaultAgents) {
       try {
@@ -1853,7 +2193,7 @@ function swarmRoutes(): Router {
         const createdISO = createdMatch?.[1] || new Date().toISOString()
         const localDate = new Date(createdISO)
         const createdTime = `${String(localDate.getHours()).padStart(2,'0')}:${String(localDate.getMinutes()).padStart(2,'0')}:${String(localDate.getSeconds()).padStart(2,'0')}`
-        agentRegistry.set(`${createdTime}-${agentId}`, { id: agentId, name: ag.name, type: ag.type })
+        agentRegistry.set(`${createdTime}-${agentId}`, { id: agentId, name: ag.name, type: ag.type, profileId: ag.profileId })
         currentSwarmAgentIds.add(agentId)
         spawnedAgents.push({ id: agentId, name: ag.name, type: ag.type, status: 'running', createdAt: createdISO })
       } catch (e) {
@@ -1908,6 +2248,8 @@ function swarmRoutes(): Router {
     lastSwarmId = ''
     lastSwarmCreatedAt = ''
     swarmShutdown = true
+    // Tear down scheduler so stale agent IDs never linger across re-inits.
+    resetGlobalScheduler()
     broadcast('swarm:status', { status: 'shutdown' })
     res.json({ status: 'shutdown' })
   }))
@@ -1916,7 +2258,7 @@ function swarmRoutes(): Router {
 
 // In-memory registry to track agent names/IDs (CLI table doesn't include them)
 // Keyed by created time (HH:MM:SS) since CLI table only shows that
-const agentRegistry: Map<string, { id: string; name: string; type: string }> = new Map()
+const agentRegistry: Map<string, { id: string; name: string; type: string; profileId?: string }> = new Map()
 const terminatedAgents = new Set<string>() // set of created-time keys
 let allTerminatedBefore: string | null = null // ISO timestamp: ignore all CLI agents created before this
 
@@ -2171,6 +2513,8 @@ function agentRoutes(): Router {
   }))
   r.post("/terminate-all", h(async (_req, res) => {
     const stopped = await purgeAllCliAgents()
+    // Unregister every scheduler agent so stale IDs cannot claim slots later.
+    resetGlobalScheduler()
     broadcast("agents:cleared", {})
     res.json({ terminated: stopped, status: "all terminated" })
   }))
@@ -2187,6 +2531,7 @@ interface TaskRecord {
   id: string; title: string; description: string; status: string
   priority: string; assignedTo?: string; createdAt: string; startedAt?: string; completedAt?: string; result?: string
     agentResults?: Array<{ index: number; agent: string; task: string; result: string }>
+    subtaskStatuses?: Array<'pending' | 'completed' | 'failed' | 'cancelled'>
   sessionUUID?: string; swarmRunId?: string
   /** Working directory for claude -p processes */
   cwd?: string
@@ -2296,6 +2641,10 @@ function taskRoutes(): Router {
           cleanupProcess(key)
         }
       }
+
+      // Cancel every scheduler subtask tied to this task so dependents
+      // surface typed dependency-cancelled errors and never re-run later.
+      try { getGlobalScheduler().cancelTask(id) } catch { /* scheduler may be torn down */ }
 
       // Cancel linked workflow
       for (const [wfId, wf] of workflowStore.entries()) {
@@ -3227,6 +3576,8 @@ function swarmMonitorRoutes(): Router {
   // Purge all zombie agents
   r.post('/purge', h(async (_req, res) => {
     const stopped = await purgeAllCliAgents()
+    // Unregister every scheduler agent so stale IDs cannot claim slots later.
+    resetGlobalScheduler()
     broadcast('swarm-monitor:purged', { stopped })
     res.json({ stopped, message: `Purged ${stopped} agents` })
   }))
