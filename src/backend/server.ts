@@ -1270,11 +1270,13 @@ async function launchSwarmPipeline(
 
     const roleInstructions: Record<string, string> = {
       researcher: 'RESEARCH phase: explore the codebase, find relevant files, understand existing patterns and dependencies',
-      coder: 'IMPLEMENTATION phase: write/edit code, create files, run build commands',
+      coder: 'IMPLEMENTATION phase: inspect and modify application code, create files, run builds and tests; remain read-only when the task explicitly says READ-ONLY',
       tester: 'TESTING phase: write unit/integration tests, run the test suite, verify the implementation works',
       reviewer: 'REVIEW phase: review the code changes for quality, bugs, security issues, and adherence to project conventions',
       analyst: 'ANALYSIS phase: analyze requirements, define technical specifications',
       architect: 'ARCHITECTURE phase: design the solution structure, define interfaces and patterns',
+      'devops-engineer': 'DEVOPS IMPLEMENTATION phase: inspect and modify infrastructure, services, CI, configuration and operational scripts; never push, merge or deploy without explicit authorization',
+      'security-architect': 'SECURITY phase: inspect authentication, authorization, tenant isolation, secrets and dependency risks; provide fail-closed recommendations',
     }
 
     const planPrompt = [
@@ -1317,6 +1319,21 @@ async function launchSwarmPipeline(
       try { subtasks = JSON.parse(jsonMatch[0]) } catch (e) {
         console.warn('[pipeline] Failed to parse subtask plan JSON:', e instanceof Error ? e.message : String(e))
       }
+    }
+
+    if (subtasks.length > 0) {
+      const finalReviewerDependencies = subtasks.map((_, index) => index)
+      subtasks.push({
+        agent: 'reviewer',
+        task: [
+          'FINAL REVIEW: Review every prior subtask result against the original task.',
+          `Original task: ${taskDesc}`,
+          'Return one complete standalone final answer satisfying every requested deliverable.',
+          'For plans and reports, include the complete requested content, not only a verdict.',
+          'Keep the final answer at or below 10000 characters. Never push, merge, or deploy.',
+        ].join('\n'),
+        depends_on: finalReviewerDependencies,
+      })
     }
 
     const planStep = wf.steps.find(s => s.id === 'step-plan')
@@ -1365,17 +1382,20 @@ async function launchSwarmPipeline(
           broadcast('task:output', { id: taskId, workflowId, type: 'text', content: `  [${agent.name}] ${st.task.slice(0, 100)}` })
 
           // Build context from dependencies
+          const isFinalReviewer = st.agent === 'reviewer' && st.idx === subtasks.length - 1
           const depContext = st.depends_on.length > 0
-            ? '\n\nPrevious results:\n' + st.depends_on.map(d => `[${subtasks[d].agent}]: ${results[d].slice(0, 500)}`).join('\n')
+            ? '\n\nPrevious results:\n' + st.depends_on.map(d => `[${subtasks[d].agent}]: ${isFinalReviewer ? results[d] : results[d].slice(0, 500)}`).join('\n')
             : ''
 
           const roleSystemPrompts: Record<string, string> = {
             researcher: 'You are a researcher agent. Your job is to explore the codebase, find relevant files, read code, and report your findings clearly. Use Read, Grep, Glob tools. Do NOT modify any files.',
-            coder: 'You are a coder agent. Your job is to implement code changes. Write clean, correct code. Use Edit/Write tools. Follow existing project conventions.',
+            coder: 'You are a full-stack implementation engineer. Inspect and modify application code, create files, and run builds and tests. If the task explicitly says READ-ONLY, do not modify files. Never push, merge, or deploy unless explicitly authorized.',
             tester: 'You are a tester agent. Write and run tests when implementation is allowed. For READ-ONLY or audit tasks, do not modify files; inspect and run existing tests only. Report results clearly.',
             reviewer: 'You are a code reviewer agent. Review the code changes for bugs, security issues, style problems, and adherence to best practices. Report issues found.',
             analyst: 'You are an analyst agent. Analyze requirements and produce clear technical specifications.',
             architect: 'You are an architect agent. Design system architecture, define patterns, interfaces and data flow.',
+            'devops-engineer': 'You are a DevOps implementation engineer. Inspect and modify infrastructure, service units, CI, configuration, and operational scripts. Build and verify before restart. Never push, merge, deploy, or expose secrets unless explicitly authorized. Remain read-only when the task says READ-ONLY.',
+            'security-architect': 'You are a security architect. Inspect authentication, authorization, tenant isolation, secrets, dependency risks, and fail-closed behavior. Remain read-only unless implementation is explicitly authorized.',
           }
           const agentPrompt = `Complete this task:\n\n${st.task}${depContext}`
           const sysPrompt = roleSystemPrompts[st.agent] || `You are a ${st.agent} agent in a development swarm. Do your assigned work precisely. Do not ask questions, just execute.`
@@ -1402,6 +1422,13 @@ async function launchSwarmPipeline(
             await Promise.all(wave)
           }
       }
+
+      task.agentResults = subtasks.map((st, index) => ({
+        index,
+        agent: st.agent,
+        task: st.task,
+        result: results[index] || '',
+      }))
 
       const finalReviewerIndex = subtasks.map(st => st.agent).lastIndexOf('reviewer')
         task.result = (results[finalReviewerIndex] || [...results].reverse().find(Boolean) || 'Pipeline completed').slice(0, 12000)
@@ -1806,12 +1833,14 @@ function swarmRoutes(): Router {
 
     // Auto-spawn a default set of specialized agents for the swarm
     const defaultAgents: Array<{ type: string; name: string }> = [
-      { type: 'coordinator', name: 'Coordinator' },
-      { type: 'coder', name: 'Developer-1' },
-      { type: 'coder', name: 'Developer-2' },
-      { type: 'researcher', name: 'Analyst' },
-      { type: 'tester', name: 'Tester' },
-      { type: 'reviewer', name: 'Reviewer' },
+      { type: 'coordinator', name: 'Queen Dispatcher' },
+      { type: 'researcher', name: 'Cartographer' },
+      { type: 'architect', name: 'System Architect' },
+      { type: 'coder', name: 'Full-stack Engineer' },
+      { type: 'devops-engineer', name: 'DevOps Engineer' },
+      { type: 'security-architect', name: 'Security Auditor' },
+      { type: 'tester', name: 'QA Auditor' },
+      { type: 'reviewer', name: 'Final Reviewer' },
     ]
     const spawnedAgents: Array<{ id: string; name: string; type: string; status: string; createdAt: string }> = []
     for (const ag of defaultAgents) {
@@ -1824,7 +1853,7 @@ function swarmRoutes(): Router {
         const createdISO = createdMatch?.[1] || new Date().toISOString()
         const localDate = new Date(createdISO)
         const createdTime = `${String(localDate.getHours()).padStart(2,'0')}:${String(localDate.getMinutes()).padStart(2,'0')}:${String(localDate.getSeconds()).padStart(2,'0')}`
-        agentRegistry.set(createdTime, { id: agentId, name: ag.name, type: ag.type })
+        agentRegistry.set(`${createdTime}-${agentId}`, { id: agentId, name: ag.name, type: ag.type })
         currentSwarmAgentIds.add(agentId)
         spawnedAgents.push({ id: agentId, name: ag.name, type: ag.type, status: 'running', createdAt: createdISO })
       } catch (e) {
@@ -2091,7 +2120,7 @@ function agentRoutes(): Router {
     const localDate = new Date(createdISO)
     const createdTime = `${String(localDate.getHours()).padStart(2,'0')}:${String(localDate.getMinutes()).padStart(2,'0')}:${String(localDate.getSeconds()).padStart(2,'0')}`
     // Register by local created time for lookup when list refreshes
-    agentRegistry.set(createdTime, { id: agentId, name: name || type || 'agent', type: type || 'coder' })
+    agentRegistry.set(`${createdTime}-${agentId}`, { id: agentId, name: name || type || 'agent', type: type || 'coder' })
     const result = { raw, id: agentId, type, name, status: 'spawned', createdAt: createdISO }
     broadcast('agent:added', result)
     res.json(result)
@@ -2162,6 +2191,7 @@ function agentRoutes(): Router {
 interface TaskRecord {
   id: string; title: string; description: string; status: string
   priority: string; assignedTo?: string; createdAt: string; startedAt?: string; completedAt?: string; result?: string
+    agentResults?: Array<{ index: number; agent: string; task: string; result: string }>
   sessionUUID?: string; swarmRunId?: string
   /** Working directory for claude -p processes */
   cwd?: string
