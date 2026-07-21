@@ -254,7 +254,7 @@ export function initTelegramBot(config: TelegramConfig, stores: TelegramStores):
     if (task.assignedTo) lines.push(`Assigned: ${h(task.assignedTo)}`)
     if (task.startedAt) lines.push(`Started: ${h(task.startedAt)}`)
     if (task.completedAt) lines.push(`Completed: ${h(task.completedAt)}`)
-    if (task.result) lines.push(`\nResult: ${h(truncate(task.result, 200))}`)
+    if (task.result) lines.push(`\nResult: ${h(truncate(task.result, 2400))}`)
     if (task.description) lines.push(`\nDescription: ${h(truncate(task.description, 200))}`)
     const keyboard: TelegramBot.InlineKeyboardButton[][] = []
     if (task.status === 'pending' || task.status === 'in_progress') {
@@ -431,8 +431,8 @@ export function initTelegramBot(config: TelegramConfig, stores: TelegramStores):
           progressThrottle.delete(taskId)
         }
         if (status === 'completed' && notif.taskCompleted) {
-          const result = truncate(String(p?.result ?? 'No result'), 200)
-          send(`Task completed: <b>${h(title)}</b>\n${h(result)}`)
+          const result = truncate(String(p?.result ?? 'No result'), 2400)
+          send(`Task completed: <b>${h(title)}</b>\nID: <code>${h(taskId)}</code>\n\n${h(result)}`)
         } else if (status === 'failed' && notif.taskFailed) {
           const result = truncate(String(p?.result ?? 'No details'), 200)
           send(`Task failed: <b>${h(title)}</b>\n${h(result)}`)

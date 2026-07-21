@@ -1118,6 +1118,18 @@ async function launchSwarmPipeline(
   wf: WorkflowRecord, workflowId: string,
   agents: Array<{ id: string; name: string; type: string }>,
 ): Promise<void> {
+  // Register the UI pipeline as the current swarm.
+  currentSwarmAgentIds = new Set(agents.map(agent => agent.id))
+  for (const agent of agents) {
+    terminatedAgents.delete(agent.id)
+    agentRegistry.set(agent.id, {
+      id: agent.id,
+      name: agent.name,
+      type: agent.type,
+    })
+  }
+  persistState()
+
   const coordinator = agents.find(a => a.type === 'coordinator')
   const workers = agents.filter(a => a.type !== 'coordinator')
   const cleanEnv = { ...process.env }
@@ -1140,7 +1152,13 @@ async function launchSwarmPipeline(
       if (agentId) {
         updateAgentActivity(agentId, { status: 'working', currentTask: taskId, currentAction: planOnly ? 'Planning...' : prompt.slice(0, 60) })
       }
-      const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose']
+      const parentPacket = taskDesc.match(/PACKET-ID:\s*([A-Za-z0-9._-]+)/i)?.[1] || taskId
+      const packetMode = taskDesc.match(/MODE:\s*([A-Za-z-]+)/i)?.[1]
+      const packetPhase = (planOnly ? 'PLAN' : (agentId || 'MAIN')).replace(/[^A-Za-z0-9._-]/g, '-')
+      const packetPrompt = prompt.startsWith('PACKET-ID:')
+        ? prompt
+        : `PACKET-ID: ${parentPacket}-${packetPhase}\n${packetMode ? 'MODE: ' + packetMode + '\n' : ''}PARENT-TASK-ID: ${taskId}\n${prompt}`
+      const args = ['-p', packetPrompt, '--output-format', 'stream-json', '--verbose']
       if (planOnly) {
         // Restricted mode: no tools, single response — forces pure text output
         args.push('--max-turns', '1')
@@ -1274,7 +1292,7 @@ async function launchSwarmPipeline(
       `3. After implementation by "coder", ALWAYS add a "tester" or "reviewer" subtask to validate`,
       `4. Each subtask must be self-contained with enough context for the agent to work independently`,
       `5. Use depends_on to chain tasks that need results from previous steps`,
-      `6. Keep it practical: 3-5 subtasks for complex tasks, 2-3 for simple ones`,
+      `6. For full audits, use every relevant specialist and add a final reviewer validation; otherwise use 3-5 subtasks`,
       '',
       `Respond ONLY with a JSON array. Each subtask has:`,
       `- "agent": one of [${workerTypes.map(t => `"${t}"`).join(', ')}]`,
@@ -1315,7 +1333,7 @@ async function launchSwarmPipeline(
         const result = await runClaude(taskDesc, `You are a ${coder.type} agent. Complete this task thoroughly.`, coder.id)
         const execStep = wf.steps.find(s => s.id === 'step-exec')
         if (execStep) execStep.status = 'completed'
-        task.result = result.slice(0, 2000) || 'Completed'
+        task.result = result.slice(0, 12000) || 'Completed'
       }
     } else {
       // ── PHASE 2: Execute subtasks respecting dependencies ──
@@ -1333,8 +1351,11 @@ async function launchSwarmPipeline(
           break
         }
 
-        // Run ready subtasks in parallel
-        const wave = ready.map(async (st) => {
+          // Run ready subtasks with bounded parallelism.
+          const maxConcurrent = Math.max(1, Math.min(2, Number(process.env.RUFLO_PIPELINE_MAX_CONCURRENT || 2) || 2))
+          for (let batchStart = 0; batchStart < ready.length; batchStart += maxConcurrent) {
+            const batch = ready.slice(batchStart, batchStart + maxConcurrent)
+            const wave = batch.map(async (st) => {
           const agent = workers.find(w => w.type === st.agent) || workers[0]
           if (!agent) return
 
@@ -1351,7 +1372,7 @@ async function launchSwarmPipeline(
           const roleSystemPrompts: Record<string, string> = {
             researcher: 'You are a researcher agent. Your job is to explore the codebase, find relevant files, read code, and report your findings clearly. Use Read, Grep, Glob tools. Do NOT modify any files.',
             coder: 'You are a coder agent. Your job is to implement code changes. Write clean, correct code. Use Edit/Write tools. Follow existing project conventions.',
-            tester: 'You are a tester agent. Write comprehensive tests and run them. Verify that implementations work correctly. Report test results clearly.',
+            tester: 'You are a tester agent. Write and run tests when implementation is allowed. For READ-ONLY or audit tasks, do not modify files; inspect and run existing tests only. Report results clearly.',
             reviewer: 'You are a code reviewer agent. Review the code changes for bugs, security issues, style problems, and adherence to best practices. Report issues found.',
             analyst: 'You are an analyst agent. Analyze requirements and produce clear technical specifications.',
             architect: 'You are an architect agent. Design system architecture, define patterns, interfaces and data flow.',
@@ -1378,10 +1399,12 @@ async function launchSwarmPipeline(
           broadcast('workflow:updated', wf)
         })
 
-        await Promise.all(wave)
+            await Promise.all(wave)
+          }
       }
 
-      task.result = results.filter(Boolean).join('\n---\n').slice(0, 2000) || 'Pipeline completed'
+      const finalReviewerIndex = subtasks.map(st => st.agent).lastIndexOf('reviewer')
+        task.result = (results[finalReviewerIndex] || [...results].reverse().find(Boolean) || 'Pipeline completed').slice(0, 12000)
     }
 
     // ── PHASE 3: Mark complete ──
@@ -3057,6 +3080,38 @@ function swarmMonitorRoutes(): Router {
       const totalMemMB = Math.round(os.totalmem() / 1024 / 1024)
       const usedMemMB = Math.round((os.totalmem() - os.freemem()) / 1024 / 1024)
 
+        // Merge persisted UI agents with the CLI agent list.
+        const knownAgentIds = new Set(
+          agents.map(a => String(a.agentId || a.id || '')).filter(Boolean),
+        )
+        for (const [key, reg] of agentRegistry.entries()) {
+          const id = String(reg.id || key)
+          if (!id || knownAgentIds.has(id) || terminatedAgents.has(key) || terminatedAgents.has(id)) continue
+          agents.push({
+            id,
+            agentId: id,
+            name: reg.name,
+            type: reg.type,
+            agentType: reg.type,
+            status: agentActivity.get(id)?.status || 'idle',
+            createdAt: lastSwarmCreatedAt || new Date().toISOString(),
+          })
+          knownAgentIds.add(id)
+        }
+
+        const roleDisplayNames: Record<string, string> = {
+          coordinator: 'Queen Dispatcher',
+          researcher: 'Cartographer',
+          architect: 'System Architect',
+          analyst: 'Backend Auditor',
+          reviewer: 'Frontend Auditor',
+          'security-architect': 'Security Auditor',
+          'security-auditor': 'Security Auditor',
+          'performance-engineer': 'Performance Auditor',
+          tester: 'QA Auditor',
+          coder: 'Implementation Agent',
+        }
+
       // Merge health data into agents
       const enrichedAgents = agents
         .filter(a => {
@@ -3070,6 +3125,9 @@ function swarmMonitorRoutes(): Router {
         })
         .map(a => {
         const id = String(a.agentId || a.id || '')
+          const registered = agentRegistry.get(id) ||
+            [...agentRegistry.values()].find(reg => String(reg.id) === id)
+          const agentType = String(registered?.type || a.agentType || a.type || 'unknown')
         const health = healthMap.get(id) || {}
         const activity = agentActivity.get(id)
         const isWorking = (activity?.status || a.status) === 'active' || (activity?.status || a.status) === 'working'
@@ -3082,7 +3140,9 @@ function swarmMonitorRoutes(): Router {
         const agentMemLimit = Math.round(totalMemMB / agentCount)
         return {
           id,
-          type: a.agentType || a.type || 'unknown',
+            name: registered?.name || a.name || roleDisplayNames[agentType] || id,
+            type: agentType,
+            agentType,
           status: activity?.status || a.status || 'idle',
           health: a.health ?? 1,
           taskCount: (activity?.currentTask ? 1 : 0) + [...taskStore.values()].filter(t => t.assignedTo === id && t.status === 'in_progress').length,
@@ -3107,7 +3167,13 @@ function swarmMonitorRoutes(): Router {
         strategy: swarm.strategy || lastSwarmStrategy || 'specialized',
         progress: swarm.progress || 0,
         agents: enrichedAgents,
-        agentSummary: swarmAgents || { total: enrichedAgents.length, active: enrichedAgents.filter(a => a.status === 'active').length, idle: enrichedAgents.filter(a => a.status === 'idle').length, completed: 0 },
+          agentSummary: {
+            ...(swarmAgents || {}),
+            total: enrichedAgents.length,
+            active: enrichedAgents.filter(a => a.status === 'active' || a.status === 'working').length,
+            idle: enrichedAgents.filter(a => a.status === 'idle' || a.status === 'spawned').length,
+            completed: Number(swarmAgents?.completed || 0),
+          },
         taskSummary: swarm.tasks || { total: 0, completed: 0, inProgress: 0, pending: 0 },
         metrics: swarm.metrics || { tokensUsed: 0, avgResponseTime: '--', successRate: '--', elapsedTime: '--' },
         coordination: swarm.coordination || { consensusRounds: 0, messagesSent: 0, conflictsResolved: 0 },
@@ -3407,7 +3473,7 @@ function gracefulShutdown() {
 process.on('SIGINT', gracefulShutdown)
 process.on('SIGTERM', gracefulShutdown)
 
-server.listen(PORT, async () => {
+server.listen(PORT, '127.0.0.1', async () => {
   console.log(`RuFloUI API server running on http://localhost:${PORT}`)
   console.log(`WebSocket available at ws://localhost:${PORT}/ws`)
 
