@@ -152,8 +152,10 @@ export function settleTaskTerminal(
       deps.broadcast('workflow:updated', wf)
     }
   }
-  // 6. Broadcast AFTER authoritative transition (transport only).
-  deps.broadcast('task:updated', { ...deps.taskStore.get(taskId)!, id: taskId })
+  // 6. The dispatcher statusChange listener owns task:updated.
+  // Emitting it here as well duplicates Telegram notifications and
+  // repeats webhook completion side effects. Workflow broadcasts above
+  // remain owned by this helper.
   return true
 }
 

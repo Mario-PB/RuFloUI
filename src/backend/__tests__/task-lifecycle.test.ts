@@ -303,6 +303,31 @@ describe('F — settleTaskTerminal preserves result and terminal guards', () => 
     settleTaskTerminal(env.deps, 't7', 'completed', '')
     expect(task.result).toBe('preexisting-output')
   })
+
+  it('emits exactly one terminal task:updated through the dispatcher status listener', () => {
+    const env = makeEnv()
+    const task: LifecycleTaskRecord = { id: 't8', status: 'in_progress' }
+    env.taskStore.set('t8', task)
+    env.dispatcher.enqueue({ id: 't8', title: '', description: '', mode: 'READ-ONLY', priority: 'normal', sourceCwd: '/tmp' })
+    const dr = env.dispatcher.get('t8')!
+    dr.status = 'in_progress'
+
+    env.dispatcher.on('statusChange', ({ taskId }) => {
+      const current = env.taskStore.get(taskId)
+      if (!current) return
+      env.deps.syncTaskRecordFromDispatcher(taskId)
+      env.deps.broadcast('task:updated', { ...current, id: taskId })
+    })
+
+    const ok = settleTaskTerminal(env.deps, 't8', 'completed', 'single-notification')
+    expect(ok).toBe(true)
+    const terminalUpdates = env.broadcasts.filter(entry => {
+      if (entry.type !== 'task:updated') return false
+      const payload = entry.payload as LifecycleTaskRecord
+      return payload.id === 't8' && payload.status === 'completed'
+    })
+    expect(terminalUpdates).toHaveLength(1)
+  })
 })
 
 // ── (G) SHARED CANCEL LIFECYCLE — HTTP, Telegram, workflow ─────────
