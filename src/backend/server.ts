@@ -13,6 +13,8 @@ import { initTelegramBot, TelegramConfig, TelegramHandle } from './telegram-bot'
 import { loadGitHubWebhookConfig, saveGitHubWebhookConfig, githubWebhookRoutes, updateWebhookEventByTaskId } from './webhook-github'
 import { loadGitLabWebhookConfig, saveGitLabWebhookConfig, gitlabWebhookRoutes, updateGitLabEventByTaskId } from './webhook-gitlab'
 import { AGENT_PROFILES, AgentProfile, findProfileById, stripTerminalReviewerAliases } from './agent-profiles'
+import { buildCanonicalPool, normalizeToCanonicalPool, pruneRegistryToCanonical, prunePersistedAgents, RuntimeAgent } from './agent-pool'
+import { parsePlannerOutput, buildDeterministicFallback } from './planner-parse'
 import { GlobalScheduler, getGlobalScheduler, resetGlobalScheduler, SubtaskRequest, Priority } from './scheduler'
 import {
   TaskDispatcher,
@@ -378,8 +380,20 @@ function loadFromDisk() {
     if (state.workflows) for (const [k, v] of state.workflows) workflowStore.set(k, v as any)
     // Restore sessions
     if (state.sessions) for (const [k, v] of state.sessions) sessionStore.set(k, v as any)
-    // Restore agent registry
-    if (state.agents) for (const [k, v] of state.agents) agentRegistry.set(k, v)
+    // Restore agent registry — ACC-TASK-QUEUE-002-FINAL-REPAIR:
+    // persisted registry is PRUNED to the canonical set on every
+    // restart. Stale entries from prior runs (and any duplicates) are
+    // dropped deterministically. Idempotent — a re-run removes nothing
+    // further. Tasks/workflows/sessions are NEVER touched.
+    if (state.agents) {
+      const pruned = prunePersistedAgents(
+        state.agents,
+        state.terminatedAgents || [],
+      )
+      const removed = state.agents.length - pruned.length
+      if (removed > 0) console.log(`[persist] Pruned ${removed} stale/non-canonical registry entries`)
+      for (const [k, v] of pruned) agentRegistry.set(k, v)
+    }
     // Restore terminated agents
     if (state.terminatedAgents) for (const id of state.terminatedAgents) terminatedAgents.add(id)
     // Restore agent activity
@@ -1275,23 +1289,26 @@ async function launchWorkflowForTask(taskId: string, title: string, description:
   workflowStore.set(workflowId, wf)
   broadcast('workflow:added', wf)
 
-  // If swarm is active with agents, use the multi-agent pipeline
-  const activeAgents = getActiveSwarmAgents()
-  if (!swarmShutdown && activeAgents.length > 0) {
-    console.log(`[TASK ${taskId}] Multi-agent pipeline with ${activeAgents.length} agents`)
-    launchSwarmPipeline(taskId, task, taskDesc, title, wf, workflowId, activeAgents)
+  // ACC-TASK-QUEUE-002-FINAL-REPAIR: the executable pool is ALWAYS the
+  // canonical AGENT_PROFILES set. Stale registry entries cannot
+  // influence the count or composition of the pool.
+  const canonicalPool = buildCanonicalPool()
+  if (!swarmShutdown && canonicalPool.length > 0) {
+    console.log(`[TASK ${taskId}] Multi-agent pipeline with ${canonicalPool.length} agents`)
+    launchSwarmPipeline(taskId, task, taskDesc, title, wf, workflowId, canonicalPool)
   } else {
-    console.log(`[TASK ${taskId}] Single-agent fallback (swarmShutdown=${swarmShutdown}, agents=${activeAgents.length})`)
+    console.log(`[TASK ${taskId}] Single-agent fallback (swarmShutdown=${swarmShutdown}, agents=${canonicalPool.length})`)
     // Fallback: single claude -p
     launchViaClaude(taskId, task, taskDesc, title, wf, workflowId)
   }
 }
 
-// Get active agents from registry, excluding terminated
-function getActiveSwarmAgents(): Array<{ id: string; name: string; type: string }> {
-  return Array.from(agentRegistry.entries())
-    .filter(([key]) => !terminatedAgents.has(key))
-    .map(([, reg]) => reg)
+// Canonical executable pool. ALWAYS exactly AGENT_PROFILES, in declared
+// order, unique by profileId. The legacy registry-derived list is
+// retained only for backward-compatible UI surfaces and is pruned to
+// the canonical set inside pruneRegistryToCanonical().
+function getActiveSwarmAgents(): RuntimeAgent[] {
+  return buildCanonicalPool()
 }
 
 // ── HIVE MIND MEMORY HELPERS ────────────────────────────────────────
@@ -1363,8 +1380,13 @@ async function storeHiveMindMemory(key: string, value: string): Promise<void> {
 async function launchSwarmPipeline(
   taskId: string, task: TaskRecord, taskDesc: string, title: string,
   wf: WorkflowRecord, workflowId: string,
-  agents: Array<{ id: string; name: string; type: string; profileId?: string }>,
+  agents: RuntimeAgent[],
 ): Promise<void> {
+  // Defensive guard: prune the in-memory registry BEFORE we register
+  // the canonical pool. This prevents any stale/historical entry from
+  // surviving into a subsequent launch even if a code path added one.
+  pruneRegistryToCanonical(agentRegistry, terminatedAgents)
+
   // Register the UI pipeline as the current swarm.
   currentSwarmAgentIds = new Set(agents.map(agent => agent.id))
   for (const agent of agents) {
@@ -1609,13 +1631,16 @@ async function launchSwarmPipeline(
       throw err
     }
 
-    // Parse the plan
-    const jsonMatch = planResult.match(/\[[\s\S]*\]/)
-    let subtasks: Array<{ capability?: string; agent?: string; task: string; depends_on: number[] }> = []
-    if (jsonMatch) {
-      try { subtasks = JSON.parse(jsonMatch[0]) } catch (e) {
-        console.warn('[pipeline] Failed to parse subtask plan JSON:', e instanceof Error ? e.message : String(e))
-      }
+    // Parse the plan — ACC-TASK-QUEUE-002-FINAL-REPAIR: robust to bare
+    // JSON, fenced JSON, surrounding prose, and balanced-bracket
+    // extraction. Any parse failure -> null -> deterministic fallback.
+    const isReadOnly = /\bread[- ]?only\b/i.test(taskDesc)
+    let subtasks: Array<{ capability?: string; agent?: string; task: string; depends_on?: number[] }> = []
+    try {
+      const parsed = parsePlannerOutput(planResult)
+      if (parsed) subtasks = parsed
+    } catch (e) {
+      console.warn('[pipeline] Failed to parse subtask plan JSON:', e instanceof Error ? e.message : String(e))
     }
 
     // Backwards compat: also accept old "agent" field by treating it as a hint.
@@ -1629,24 +1654,8 @@ async function launchSwarmPipeline(
     // WRITE tasks: implementation -> tests -> final-review
     // READ-ONLY tasks: analysis -> final-review
     const plannerInvalid = subtasks.length === 0
-    const isReadOnly = /\bread[- ]?only\b/i.test(taskDesc)
-
-    function buildDeterministicFallback(): Array<{ capability: string; task: string; depends_on: number[] }> {
-      if (isReadOnly) {
-        return [
-          { capability: 'research', task: `Analyze the following request and produce findings: ${taskDesc}`, depends_on: [] },
-          { capability: 'final-review', task: 'FINAL REVIEW: Synthesize the analysis into a complete deliverable.', depends_on: [0] },
-        ]
-      }
-      return [
-        { capability: 'backend', task: `Implement the requested change: ${taskDesc}`, depends_on: [] },
-        { capability: 'qa', task: 'Add or update tests covering the implementation and run the test suite.', depends_on: [0] },
-        { capability: 'final-review', task: 'FINAL REVIEW: Synthesize implementation + test results into a final deliverable.', depends_on: [0, 1] },
-      ]
-    }
-
     if (plannerInvalid) {
-      subtasks = buildDeterministicFallback()
+      subtasks = buildDeterministicFallback(taskDesc, isReadOnly)
       broadcast('task:output', { id: taskId, workflowId, type: 'text', content: '[Fallback] Planner JSON invalid, dispatching deterministic chain' })
     }
 
@@ -2532,13 +2541,11 @@ function swarmRoutes(): Router {
     if (swarmShutdown) { res.json({ status: 'inactive' }); return }
     try {
       const { raw } = await execCli('swarm', ['status'])
-      // Build agents list from registry (exclude terminated)
-      const agentsList = Array.from(agentRegistry.entries())
-        .filter(([key]) => !terminatedAgents.has(key))
-        .map(([, reg]) => ({
-          id: reg.id, name: reg.name, type: reg.type,
-          status: 'running' as const, createdAt: '',
-        }))
+      // ACC-TASK-QUEUE-002-FINAL-REPAIR: agents list ALWAYS reflects
+      // the canonical pool (AGENT_PROFILES, in declared order). Stale
+      // registry entries cannot inflate activeAgents or change the
+      // composition of the pool surfaced to the UI.
+      const agentsList = buildCanonicalPool()
       const activeCount = agentsList.length
       res.json({
         raw,
@@ -2548,7 +2555,10 @@ function swarmRoutes(): Router {
         status: 'active',
         maxAgents: lastSwarmMaxAgents,
         activeAgents: activeCount,
-        agents: agentsList,
+        agents: agentsList.map(a => ({
+          id: a.id, name: a.name, type: a.type,
+          status: 'running' as const, createdAt: '',
+        })),
         createdAt: lastSwarmCreatedAt,
       })
     } catch { res.json({ status: 'inactive' }) }
@@ -2699,6 +2709,11 @@ function agentRoutes(): Router {
   const r = Router()
   r.get('/', h(async (_req, res) => {
     try {
+      // ACC-TASK-QUEUE-002-FINAL-REPAIR: the executable/visible agent
+      // list is sourced from the canonical pool, NOT from the
+      // accumulated historical registry. Stale entries cannot leak
+      // into the API response.
+      const canonicalProfileIds = new Set(AGENT_PROFILES.map(p => p.profileId))
       const { raw } = await execCli('agent', ['list'])
       const rows = parseCliTable(raw)
       let agents = rows
@@ -2709,6 +2724,11 @@ function agentRoutes(): Router {
             const iso = timeToISO(created)
             if (iso <= allTerminatedBefore) return false
           }
+          // Filter by registry-known profileId; unknown rows (CLI
+          // residue without a profileId) are dropped because we cannot
+          // guarantee they belong to the canonical pool.
+          const reg = agentRegistry.get(created)
+          if (!reg || !reg.profileId || !canonicalProfileIds.has(reg.profileId)) return false
           return true
         })
         .map((row, i) => {
@@ -2720,6 +2740,7 @@ function agentRoutes(): Router {
             id: agentId,
             name: reg?.name || row.name || row.type || `Agent ${i + 1}`,
             type: row.type || reg?.type || 'unknown',
+            profileId: reg?.profileId,
             status: activity?.status === 'working' ? 'running' : (row.status || 'idle'),
             createdAt: timeToISO(created),
             lastActivity: activity?.lastUpdate || ((row.last_activity || row['last_acti']) === 'N/A' ? undefined : row.last_activity),
@@ -2743,6 +2764,8 @@ function agentRoutes(): Router {
               .filter(a => {
                 const created = String(a.createdAt || '')
                 if (allTerminatedBefore && created <= allTerminatedBefore) return false
+                const pid = String(a.profileId || a.agentProfile || '')
+                if (pid && !canonicalProfileIds.has(pid)) return false
                 return true
               })
               .map((a, i) => {
@@ -2752,6 +2775,7 @@ function agentRoutes(): Router {
                   id,
                   name: String(a.name || a.agentType || a.type || `Agent ${i + 1}`),
                   type: String(a.agentType || a.type || 'unknown'),
+                  profileId: String(a.profileId || a.agentProfile || ''),
                   status: activity?.status === 'working' ? 'running' : String(a.status || 'idle'),
                   createdAt: String(a.createdAt || new Date().toISOString()),
                   lastActivity: activity?.lastUpdate || undefined,
@@ -3863,23 +3887,38 @@ function swarmMonitorRoutes(): Router {
       const totalMemMB = Math.round(os.totalmem() / 1024 / 1024)
       const usedMemMB = Math.round((os.totalmem() - os.freemem()) / 1024 / 1024)
 
-        // Merge persisted UI agents with the CLI agent list.
+        // ACC-TASK-QUEUE-002-FINAL-REPAIR: persisted UI agents whose
+        // profileId is not in the canonical AGENT_PROFILES set are
+        // dropped here. Stale registry entries cannot inflate the
+        // visualized agent count.
+        const canonicalProfileIds = new Set(AGENT_PROFILES.map(p => p.profileId))
         const knownAgentIds = new Set(
           agents.map(a => String(a.agentId || a.id || '')).filter(Boolean),
         )
         for (const [key, reg] of agentRegistry.entries()) {
           const id = String(reg.id || key)
           if (!id || knownAgentIds.has(id) || terminatedAgents.has(key) || terminatedAgents.has(id)) continue
+          if (!reg.profileId || !canonicalProfileIds.has(reg.profileId)) continue
           agents.push({
             id,
             agentId: id,
             name: reg.name,
             type: reg.type,
             agentType: reg.type,
+            profileId: reg.profileId,
             status: agentActivity.get(id)?.status || 'idle',
             createdAt: lastSwarmCreatedAt || new Date().toISOString(),
           })
           knownAgentIds.add(id)
+        }
+
+        // Drop CLI-listed agents whose profileId is unknown (canonical
+        // ownership is the source of truth — anything else is stale
+        // CLI residue from prior runs).
+        for (let i = agents.length - 1; i >= 0; i--) {
+          const a = agents[i]
+          const pid = String(a.profileId || a.agentProfile || '')
+          if (pid && !canonicalProfileIds.has(pid)) agents.splice(i, 1)
         }
 
         const roleDisplayNames: Record<string, string> = {
