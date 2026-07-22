@@ -22,10 +22,10 @@ function getPriorityBadge(priority: string): CSSProperties {
 }
 
 const COLUMNS: Array<{ key: string; label: string; statuses: string[] }> = [
-  { key: 'pending', label: 'Pending', statuses: ['pending'] },
+  { key: 'pending', label: 'Queued / Pending', statuses: ['pending'] },
   { key: 'in_progress', label: 'In Progress', statuses: ['in_progress'] },
   { key: 'completed', label: 'Completed', statuses: ['completed'] },
-  { key: 'failed', label: 'Failed / Cancelled', statuses: ['failed', 'cancelled'] },
+  { key: 'failed', label: 'Failed / Cancelled', statuses: ['failed', 'cancelled', 'interrupted'] },
 ]
 
 interface TaskSummary {
@@ -34,8 +34,13 @@ interface TaskSummary {
   pending: number
   inProgress: number
   failed: number
+  interrupted?: number
   completionRate: number
   averageTime: string
+  maxInFlight?: number
+  inFlight?: number
+  queued?: number
+  terminal?: number
 }
 
 const s: Record<string, CSSProperties> = {
@@ -83,6 +88,24 @@ const s: Record<string, CSSProperties> = {
   taskTitle: { fontSize: 13, fontWeight: 500, color: 'var(--text-primary)', marginBottom: 6 },
   taskMeta: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
   priorityBadge: {} as CSSProperties, // use getPriorityBadge() instead
+  modeBadge: {
+    fontSize: 10, fontWeight: 600, padding: '2px 6px', borderRadius: 8,
+    textTransform: 'uppercase', letterSpacing: '0.04em',
+  },
+  queueBadge: {
+    fontSize: 10, padding: '2px 6px', borderRadius: 8,
+    background: 'var(--bg-tertiary)', color: 'var(--text-muted)',
+  },
+  branchTag: {
+    fontSize: 11, padding: '2px 6px', borderRadius: 6,
+    background: 'rgba(6,182,212,0.12)', color: 'var(--accent-cyan)',
+    fontFamily: 'monospace',
+  },
+  cwdTag: {
+    fontSize: 11, padding: '2px 6px', borderRadius: 6,
+    background: 'rgba(139,92,246,0.12)', color: 'var(--accent-purple)',
+    fontFamily: 'monospace', wordBreak: 'break-all', maxWidth: '100%',
+  },
   agentTag: {
     fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4,
   },
@@ -184,6 +207,19 @@ function TaskCard({
       </div>
       <div style={s.taskMeta}>
         <span style={getPriorityBadge(task.priority)}>{task.priority}</span>
+        {task.mode && (
+          <span style={{
+            ...s.modeBadge,
+            background: task.mode === 'READ-ONLY' ? 'rgba(34,197,94,0.12)' : 'rgba(168,85,247,0.12)',
+            color: task.mode === 'READ-ONLY' ? 'var(--accent-green)' : 'var(--accent-purple)',
+          }}>{task.mode === 'READ-ONLY' ? 'READ' : 'WRITE'}</span>
+        )}
+        {task.queueState === 'queued' && (
+          <span style={s.queueBadge}>queued {task.queuePosition ? `#${task.queuePosition}` : ''}</span>
+        )}
+        {task.queueState === 'dispatching' && (
+          <span style={s.queueBadge}>dispatching…</span>
+        )}
         {task.assignedTo && <span style={s.agentTag}>{agentName}</span>}
         <span style={s.timeTag}>{formatTime(task.createdAt)}</span>
       </div>
@@ -221,6 +257,29 @@ function TaskCard({
           )}
           {(task as any).cwd && (
             <div style={s.detailRow}><span style={s.detailLabel}>CWD:</span><code style={{ fontFamily: 'monospace', fontSize: '0.85rem' }}>{(task as any).cwd}</code></div>
+          )}
+          {task.branchName && (
+            <div style={s.detailRow}>
+              <span style={s.detailLabel}>Branch:</span>
+              <span style={s.branchTag}>{task.branchName}</span>
+              {task.baseCommit && (
+                <span style={{ ...s.queueBadge, marginLeft: 6, fontFamily: 'monospace' }}>
+                  base {task.baseCommit.slice(0, 7)}
+                </span>
+              )}
+            </div>
+          )}
+          {task.executionCwd && task.executionCwd !== task.sourceCwd && (
+            <div style={s.detailRow}>
+              <span style={s.detailLabel}>Execution CWD:</span>
+              <span style={s.cwdTag}>{task.executionCwd}</span>
+            </div>
+          )}
+          {task.sourceCwd && (
+            <div style={s.detailRow}>
+              <span style={s.detailLabel}>Source CWD:</span>
+              <span style={s.cwdTag}>{task.sourceCwd}</span>
+            </div>
           )}
           {task.result && task.status !== 'failed' && (
             <div style={{ ...s.detailRow, maxHeight: 200, overflowY: 'auto' }}>
@@ -569,14 +628,39 @@ export default function TasksPanel() {
               <div style={s.summaryLabel}>Total Tasks</div>
             </div>
             <div style={s.summaryItem}>
+              <div style={{ ...s.summaryValue, color: 'var(--accent-cyan)' }}>
+                {summary.inFlight ?? summary.inProgress}
+                {summary.maxInFlight != null && (
+                  <span style={{ fontSize: 14, color: 'var(--text-muted)' }}> / {summary.maxInFlight}</span>
+                )}
+              </div>
+              <div style={s.summaryLabel}>In Flight</div>
+            </div>
+            <div style={s.summaryItem}>
+              <div style={{ ...s.summaryValue, color: 'var(--accent-blue)' }}>
+                {summary.queued ?? summary.pending}
+              </div>
+              <div style={s.summaryLabel}>Queued</div>
+            </div>
+            <div style={s.summaryItem}>
               <div style={{ ...s.summaryValue, color: 'var(--accent-green)' }}>
                 {summary.completionRate != null ? `${Math.round(summary.completionRate * 100)}%` : '--'}
               </div>
               <div style={s.summaryLabel}>Completion Rate</div>
             </div>
             <div style={s.summaryItem}>
-              <div style={{ ...s.summaryValue, color: 'var(--accent-cyan)' }}>{summary.completed}</div>
+              <div style={{ ...s.summaryValue, color: 'var(--accent-green)' }}>{summary.completed}</div>
               <div style={s.summaryLabel}>Completed</div>
+            </div>
+            <div style={s.summaryItem}>
+              <div style={{ ...s.summaryValue, color: 'var(--accent-red)' }}>
+                {summary.failed + (summary.interrupted || 0)}
+              </div>
+              <div style={s.summaryLabel}>Failed / Interrupted</div>
+            </div>
+            <div style={s.summaryItem}>
+              <div style={{ ...s.summaryValue, color: 'var(--accent-purple)' }}>{summary.terminal ?? 0}</div>
+              <div style={s.summaryLabel}>Terminal</div>
             </div>
             <div style={s.summaryItem}>
               <div style={{ ...s.summaryValue, color: 'var(--accent-yellow)' }}>

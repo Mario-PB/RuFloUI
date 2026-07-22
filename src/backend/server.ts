@@ -14,6 +14,15 @@ import { loadGitHubWebhookConfig, saveGitHubWebhookConfig, githubWebhookRoutes, 
 import { loadGitLabWebhookConfig, saveGitLabWebhookConfig, gitlabWebhookRoutes, updateGitLabEventByTaskId } from './webhook-gitlab'
 import { AGENT_PROFILES, AgentProfile, findProfileById, stripTerminalReviewerAliases } from './agent-profiles'
 import { GlobalScheduler, getGlobalScheduler, resetGlobalScheduler, SubtaskRequest, Priority } from './scheduler'
+import {
+  TaskDispatcher,
+  DispatcherTaskRecord,
+  TaskMode,
+  detectTaskMode,
+  getTaskDispatcher,
+} from './task-dispatcher'
+import { getWorktreeManager } from './task-worktrees'
+import { settleTaskTerminal as settleTaskTerminalImpl, cancelTask as cancelTaskImpl, LifecycleDeps } from './task-lifecycle'
 
 const execAsync = promisify(exec)
 const execFileAsync = promisify(execFile)
@@ -143,7 +152,13 @@ async function handleWebhookTaskCompletion(taskId: string): Promise<void> {
   const task = taskStore.get(taskId)
   if (!task || !(task as any).webhookMeta || !task.cwd) return
   const meta: WebhookMeta = (task as any).webhookMeta
-  const repoDir = task.cwd
+  // Use the dispatcher's actual execution cwd + branch (assigned during
+  // worktreeProvisioned). The cloned repoDir is the SOURCE; the worktree
+  // path is where Claude actually wrote the changes.
+  const dr = dispatcher.get(taskId)
+  const repoDir = dr?.executionCwd || task.executionCwd || task.cwd
+  // Branch the dispatcher actually created — never the legacy webhookMeta.
+  const branchName = dr?.worktree?.branchName || meta.branchName
 
   try {
     // Check if there are any changes to commit
@@ -153,14 +168,11 @@ async function handleWebhookTaskCompletion(taskId: string): Promise<void> {
       return
     }
 
-    const branchName = meta.branchName
-    console.log(`[webhook-repo] Committing and pushing changes for task ${taskId} on branch ${branchName}`)
+    console.log(`[webhook-repo] Committing and pushing changes for task ${taskId} on branch ${branchName} in ${repoDir}`)
 
-    // Create branch, add, commit, push
-    // Create branch or switch to it if it already exists
-    await execAsync(`git checkout -b "${branchName}"`, { cwd: repoDir }).catch(() =>
-      execAsync(`git checkout "${branchName}"`, { cwd: repoDir })
-    )
+    // The dispatcher has already provisioned the worktree + branch — no
+    // git checkout -b here. We are already ON the right branch in the
+    // worktree.
     await execAsync('git add -A', { cwd: repoDir })
     const commitMsg = `fix: resolve issue #${meta.issueNumber}\n\nAutomated fix by RuFloUI multi-agent pipeline.\nTask: ${taskId}\nIssue: ${meta.issueUrl}`
     await execAsync(`git commit -m "${commitMsg.replace(/"/g, '\\"')}"`, { cwd: repoDir })
@@ -298,6 +310,8 @@ interface PersistedState {
   lastPerfMetrics: unknown
   benchmarkHasRun: boolean
   currentSwarmAgentIds: string[]
+  /** Serialised dispatcher task queue snapshot (pending + terminal records). */
+  dispatcherTasks: Array<[string, unknown]>
 }
 
 function ensurePersistDir() {
@@ -333,6 +347,7 @@ function saveToDisk() {
       lastPerfMetrics,
       benchmarkHasRun,
       currentSwarmAgentIds: [...currentSwarmAgentIds],
+      dispatcherTasks: dispatcher.snapshot().map(t => [t.id, { ...t }] as [string, unknown]),
     }
     // Atomic write: write to .tmp then rename to prevent corruption on crash
     const target = path.join(PERSIST_DIR, 'state.json')
@@ -387,6 +402,37 @@ function loadFromDisk() {
       currentSwarmAgentIds = new Set(state.currentSwarmAgentIds)
     }
 
+    // Restore dispatcher queue snapshot. Pending tasks are re-enqueued
+    // (idempotent). Terminal records are restored via a direct re-add
+    // path so that recovery sweeps don't inadvertently re-run them.
+    let restoredDispatcher = 0
+    let interruptedDispatcher = 0
+    if (state.dispatcherTasks && Array.isArray(state.dispatcherTasks)) {
+      // Side-effect-free hydrate (blocker 5): no enqueue, no microtask
+      // launches during the pass; ready-queue is populated and then a
+      // single explicit `dispatchAfterHydrate` decides what runs next.
+      const snapshot = state.dispatcherTasks.map(([, raw]) => raw as any).filter(Boolean)
+      const recovery = dispatcher.hydrateFromSnapshot(snapshot)
+      restoredDispatcher = recovery.restored.length
+      interruptedDispatcher = recovery.interrupted.length
+      // Mark the corresponding TaskRecords so the UI surfaces interrupted
+      // status correctly. Pending records rejoin the queue; terminal
+      // records keep their status untouched.
+      for (const id of recovery.interrupted) {
+        const tr = taskStore.get(id)
+        if (tr) {
+          tr.status = 'interrupted'
+          tr.completedAt = new Date().toISOString()
+          broadcast('task:updated', { ...tr, id })
+        }
+      }
+      // Promote ready tasks after the hydrate pass is complete.
+      dispatcher.dispatchAfterHydrate()
+      if (restoredDispatcher || interruptedDispatcher) {
+        console.log(`[persist] Dispatcher restored: ${restoredDispatcher} tasks, ${interruptedDispatcher} interrupted`)
+      }
+    }
+
     const taskCount = taskStore.size
     const wfCount = workflowStore.size
     const agentCount = agentRegistry.size
@@ -433,6 +479,13 @@ function readTaskOutputHistory(taskId: string, tail = 200): Array<{ type: string
 
 const wsClients = new Set<WebSocket>()
 
+// ── TASK DISPATCHER (declared early; used by both broadcast() hand-off
+// handlers and the task-route handlers below) ──────────────────────
+// Persistent top-level task queue layered on top of GlobalScheduler.
+// Owns: priority+FIFO ordering, max-in-flight cap, worktree provisioning
+// for WRITE tasks, restart-recovery, terminal-state guarantee.
+const dispatcher: TaskDispatcher = getTaskDispatcher()
+
 // Types that represent persistent state changes — trigger disk save
 const PERSIST_EVENTS = new Set([
   'task:added', 'task:updated', 'task:list',
@@ -443,7 +496,20 @@ const PERSIST_EVENTS = new Set([
   'performance:metrics',
 ])
 
+/**
+ * Bounded wait for a tracked process to close + canonical cancel-proc
+ * helper live in `./process-close.ts`. server.ts re-exports them so the
+ * existing route handlers keep their current call sites.
+ */
+export { waitForProcessClose, signalAndAwaitClose } from './process-close'
+import { waitForProcessClose, signalAndAwaitClose } from './process-close'
+
 function broadcast(type: string, payload: unknown) {
+  // Block B9: the broadcast transport is no longer the mechanism that
+  // mutates dispatcher state. All terminal transitions go through
+  // explicit calls in pipeline / launchViaClaude / cancel routes; this
+  // keeps a single chokepoint and prevents double-release of slots when
+  // the same payload would otherwise be re-broadcast.
   const msg = JSON.stringify({ type, payload, timestamp: new Date().toISOString() })
   for (const ws of wsClients) {
     if (ws.readyState === WebSocket.OPEN) ws.send(msg)
@@ -480,6 +546,126 @@ function broadcast(type: string, payload: unknown) {
     }
   }
 }
+
+// Wire dispatcher into the existing TaskRecord + lifecycle paths. The
+// launcher is set once launchWorkflowForTask is in scope (it currently
+// is, but to keep the file linear we forward-declare via closure capture
+// below — see the bottom of the file).
+function setDispatcherLauncher(launch: (task: DispatcherTaskRecord) => Promise<void>) {
+  dispatcher.setLauncher(launch)
+}
+
+// Helper to mirror dispatcher state back into the TaskRecord for the
+// existing API clients (list / status / WS broadcast).
+function syncTaskRecordFromDispatcher(taskId: string): void {
+  const dr = dispatcher.get(taskId)
+  const tr = taskStore.get(taskId)
+  if (!dr || !tr) return
+  if (!terminalStatusSet(tr.status) && dr.status === tr.status && dr.startedAt === tr.startedAt) return
+  tr.status = dr.status
+  tr.startedAt = dr.startedAt
+  tr.completedAt = dr.finishedAt
+  tr.executionCwd = dr.executionCwd
+  if (dr.worktree) {
+    tr.worktreePath = dr.worktree.worktreePath
+    tr.branchName = dr.worktree.branchName
+    tr.baseCommit = dr.worktree.baseCommit
+  }
+  tr.mode = dr.mode
+  tr.sourceCwd = dr.sourceCwd
+  // Public status values: pending → 'queued'; preparing → 'dispatching';
+  // in_progress → 'running'; anything terminal → 'terminal'.
+  tr.queueState = dr.status === 'pending' ? 'queued'
+    : dr.status === 'preparing' ? 'dispatching'
+    : dr.status === 'in_progress' ? (dr.running ? 'running' : 'dispatching')
+    : 'terminal'
+  tr.queuePosition = dispatcher.queuePosition(taskId)
+  tr.attempt = dr.attempt
+}
+
+const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'interrupted'])
+function terminalStatusSet(status: string | undefined): boolean {
+  return !!status && TERMINAL_STATUSES.has(status)
+}
+
+function dispatcherIsAlreadyTerminal(dr: DispatcherTaskRecord): boolean {
+  return dr.status === 'completed' || dr.status === 'failed' || dr.status === 'cancelled' || dr.status === 'interrupted'
+}
+
+/**
+ * Single explicit terminal settlement helper for dispatcher-owned tasks.
+ *
+ * Thin shim over `settleTaskTerminalImpl` in `./task-lifecycle.ts`. The
+ * production logic lives in the lifecycle module so behavioral tests can
+ * exercise it directly with isolated state Maps; this wrapper binds the
+ * module-level server.ts state (taskStore, dispatcher, broadcast, etc.)
+ * to the parameterised helper.
+ */
+function buildLifecycleDeps(): LifecycleDeps {
+  return {
+    taskStore: taskStore as unknown as LifecycleDeps['taskStore'],
+    workflowStore: workflowStore as unknown as LifecycleDeps['workflowStore'],
+    dispatcher,
+    runningProcesses,
+    broadcast,
+    persist: persistState,
+    syncTaskRecordFromDispatcher,
+    cleanupProcess,
+    getScheduler: () => getGlobalScheduler(),
+  }
+}
+function settleTaskTerminal(
+  taskId: string,
+  desired: 'completed' | 'failed',
+  result: string,
+): boolean {
+  return settleTaskTerminalImpl(buildLifecycleDeps(), taskId, desired, result)
+}
+
+dispatcher.on('statusChange', ({ taskId, status }) => {
+  const tr = taskStore.get(taskId)
+  if (!tr) return
+  syncTaskRecordFromDispatcher(taskId)
+  broadcast('task:updated', { ...tr, id: taskId })
+  persistState()
+})
+dispatcher.on('preparing', ({ taskId }) => {
+  const tr = taskStore.get(taskId)
+  if (!tr) return
+  syncTaskRecordFromDispatcher(taskId)
+  broadcast('task:updated', { ...tr, id: taskId })
+  persistState()
+})
+dispatcher.on('worktreeProvisioned', ({ taskId, worktreePath, branchName }) => {
+  const tr = taskStore.get(taskId)
+  if (!tr) return
+  syncTaskRecordFromDispatcher(taskId)
+  // Mirror the dispatcher's authoritative branch/worktree into the
+  // webhookMeta so push/PR code uses the actual branch (not the legacy
+  // "fix/issue-N" hint captured at webhook ingestion time).
+  if ((tr as any).webhookMeta) {
+    (tr as any).webhookMeta.branchName = branchName
+  }
+  // TaskRecord.cwd/executionCwd must reflect the actual worktree path.
+  tr.executionCwd = worktreePath
+  tr.worktreePath = worktreePath
+  tr.branchName = branchName
+  broadcast('task:updated', { ...tr, id: taskId, worktreePath, branchName })
+  persistState()
+})
+dispatcher.on('worktreeFailed', ({ taskId, error }) => {
+  console.warn(`[dispatcher] worktree provisioning failed for ${taskId}: ${error}`)
+})
+dispatcher.on('cancel', ({ taskId }) => {
+  const tr = taskStore.get(taskId)
+  if (!tr) return
+  syncTaskRecordFromDispatcher(taskId)
+  broadcast('task:updated', { ...tr, id: taskId })
+  persistState()
+})
+dispatcher.on('complete', () => { persistState() })
+dispatcher.on('fail', () => { persistState() })
+
 
 // Remove shell metacharacters that could enable injection in spawn(..., { shell: true }) calls
 function sanitizeShellArg(arg: string): string {
@@ -829,9 +1015,8 @@ async function pollWorkflowStatus(workflowId: string, taskId: string, maxWait = 
   const start = Date.now()
   const poll = async () => {
     if (Date.now() - start > maxWait) {
-      task.status = 'failed'
-      task.result = 'Workflow timed out after ' + (maxWait / 1000) + 's'
-      broadcast('task:updated', { ...task, id: taskId })
+      // Timeout — funnel through the explicit terminal helper.
+      settleTaskTerminal(taskId, 'failed', 'Workflow timed out after ' + (maxWait / 1000) + 's')
       return
     }
     try {
@@ -841,17 +1026,11 @@ async function pollWorkflowStatus(workflowId: string, taskId: string, maxWait = 
       const currentStatus = statusMatch?.[1] || 'unknown'
       if (wf) { wf.status = currentStatus; wf.result = raw.slice(0, 500) }
       if (currentStatus === 'completed' || currentStatus === 'done') {
-        task.status = 'completed'
-        task.completedAt = new Date().toISOString()
-        task.result = raw.slice(0, 500) || 'Workflow completed'
-        if (wf) { wf.status = 'completed'; wf.completedAt = task.completedAt }
-        broadcast('task:updated', { ...task, id: taskId })
+        settleTaskTerminal(taskId, 'completed', raw.slice(0, 500) || 'Workflow completed')
+        if (wf) { wf.status = 'completed'; wf.completedAt = task.completedAt || new Date().toISOString() }
         broadcast('workflow:updated', wf)
       } else if (currentStatus === 'failed' || currentStatus === 'error') {
-        task.status = 'failed'
-        task.result = raw.slice(0, 500) || 'Workflow failed'
-        if (wf) wf.status = 'failed'
-        broadcast('task:updated', { ...task, id: taskId })
+        settleTaskTerminal(taskId, 'failed', raw.slice(0, 500) || 'Workflow failed')
       } else {
         // Still running, poll again in 3s
         setTimeout(poll, 3000)
@@ -875,22 +1054,65 @@ function cleanupProcess(key: string) {
   processLastActivity.delete(key)
 }
 
-// Zombie reaper — kills processes with no output for ZOMBIE_TIMEOUT
+// Zombie reaper — kills processes with no output for ZOMBIE_TIMEOUT.
+//
+// FAIL-CLOSED invariants:
+//   - `proc.killed` is NOT used as evidence of closure (in Node, killed
+//     is "signal sent", not "process exited").
+//   - Every found proc is handed to the canonical signalAndAwaitClose,
+//     which attaches its own close/error listeners, sends SIGTERM,
+//     falls back to SIGKILL, and resolves ONLY when exitCode or
+//     signalCode is populated. An already-closed proc is a no-op
+//     resolved path inside the helper.
+//   - On hard rejection (ProcessCloseTimeoutError or any other
+//     failure), the reaper MUST NOT call cleanupProcess and MUST NOT
+//     remove the live process from runningProcesses tracking. The
+//     processLastActivity entry is preserved so a later tick (or the
+//     shutdown handler) can re-attempt the cleanup. The reaper logs a
+//     typed failure so operators can diagnose stuck children.
+//   - The .catch handler is mandatory — without it the rejection
+//     becomes an unhandled promise rejection that crashes the
+//     process.
 function startZombieReaper() {
   setInterval(() => {
     const now = Date.now()
     for (const [key, lastTime] of processLastActivity.entries()) {
-      if (now - lastTime > ZOMBIE_TIMEOUT) {
-        const proc = runningProcesses.get(key)
-        if (proc && !proc.killed) {
-          console.warn(`[zombie] Killing stale process ${key} (no output for ${Math.round(ZOMBIE_TIMEOUT / 1000)}s)`)
-          proc.kill('SIGTERM')
-          // Force kill after 5s if still alive
-          setTimeout(() => { if (!proc.killed) proc.kill('SIGKILL') }, 5000)
-        }
+      if (now - lastTime <= ZOMBIE_TIMEOUT) continue
+      const proc = runningProcesses.get(key)
+      // Even when proc.killed is true, the child may not have actually
+      // exited (killed is "signal sent", not "process exited"). Hand
+      // every found proc to the canonical helper — the helper handles
+      // already-closed children as a no-op resolved path.
+      if (!proc) {
+        // Tracking is dangling — drop the last-activity entry only.
         processLastActivity.delete(key)
-        cleanupProcess(key)
+        continue
       }
+      console.warn(`[zombie] Killing stale process ${key} (no output for ${Math.round(ZOMBIE_TIMEOUT / 1000)}s)`)
+      const closePromise = signalAndAwaitClose(proc, {
+        fallbackMs: 5000,
+        cleanupKey: key,
+        cleanup: cleanupProcess,
+      })
+      // Defect #5 fix: attach a typed .catch handler. On rejection we
+      // MUST NOT call cleanupProcess (the slot stays leased — the
+      // child is still alive in some sense) and MUST NOT remove the
+      // process from runningProcesses. The processLastActivity entry
+      // is also preserved so a later reaper tick (or shutdown) can
+      // re-attempt the teardown / surface diagnostics.
+      closePromise.catch((err: unknown) => {
+        const code = err && typeof err === 'object' && 'code' in err
+          ? String((err as { code?: unknown }).code ?? '')
+          : ''
+        const message = err instanceof Error ? err.message : String(err)
+        console.error(
+          `[zombie] canonical close rejected for ${key}: code=${code || 'unknown'} message=${message}. ` +
+          `process is left in runningProcesses for retry / diagnostic.`,
+        )
+        // Intentional NO-OP on cleanupProcess — the slot must stay
+        // leased while the OS still has the child. processLastActivity
+        // is left in place so the next tick (or shutdown) can retry.
+      })
     }
   }, 60_000) // check every 60s
 }
@@ -1014,6 +1236,29 @@ function buildSwarmPrompt(task: TaskRecord, taskId: string): string {
     `Swarm ID: ${lastSwarmId}, Topology: ${lastSwarmTopology}, Strategy: ${lastSwarmStrategy}`,
   ].join('\n')
 }
+
+// Dispatcher launcher: this is called by the dispatcher only AFTER the
+// task has been promoted to in_progress and (for WRITE mode) a worktree
+// is in place. The execution cwd passed here may be the worktree path
+// (WRITE) or the source cwd (READ-ONLY). The launch will fall through to
+// the existing swarm pipeline / single-agent fallback.
+async function dispatcherLauncher(dTask: DispatcherTaskRecord): Promise<void> {
+  const tr = taskStore.get(dTask.id)
+  if (!tr) {
+    dispatcher.fail(dTask.id, 'task record missing from store')
+    return
+  }
+  if (dTask.executionCwd) {
+    tr.cwd = dTask.executionCwd
+  }
+  tr.mode = dTask.mode
+  tr.sourceCwd = dTask.sourceCwd
+  tr.executionCwd = dTask.executionCwd
+  taskStore.set(dTask.id, tr)
+  await launchWorkflowForTask(dTask.id, dTask.title, dTask.description)
+}
+
+setDispatcherLauncher(dispatcherLauncher)
 
 async function launchWorkflowForTask(taskId: string, title: string, description: string): Promise<void> {
   const task = taskStore.get(taskId)
@@ -1653,6 +1898,7 @@ async function launchSwarmPipeline(
         task.result = (task.result ? task.result + '\n' : '') + 'Cancelled: at least one required worker cancelled.'
         wf.status = 'cancelled'
         wf.completedAt = task.completedAt
+        wf.result = task.result
       } else if (anyFailed || !allSettled) {
         task.status = 'failed'
         task.completedAt = new Date().toISOString()
@@ -1671,12 +1917,44 @@ async function launchSwarmPipeline(
     // Persist final result to hive mind shared memory
     // Persist final result to hive mind
     await storeHiveMindMemory(`task-result-${taskId}`, `${title}: ${(task.result || '').slice(0, 500)}`)
-    broadcast('task:updated', { ...task, id: taskId })
+    // Funnel through the explicit terminal helper. cancelled is preserved.
+    // For completed/failed the helper syncs the TaskRecord, releases the
+    // dispatcher slot, and broadcasts the authoritative transition.
+    //
+    // Defect #4: a worker-cancelled parent MUST drive the dispatcher's
+    // authoritative cancellation transition so its in-flight slot is
+    // released exactly once. settleTaskTerminal is a no-op while
+    // task.status is 'cancelled', so we drive the cancellation directly
+    // via dispatcher.cancelActive; cancelTask(running pipeline tasks)
+    // would be a no-op here because the pipeline holds the slot via the
+    // launcher, but we want the dispatcher transition to be the
+    // authoritative source of truth for the parent.
+    if (task.status === 'completed') {
+      settleTaskTerminal(taskId, 'completed', task.result || 'completed')
+    } else if (task.status === 'failed') {
+      settleTaskTerminal(taskId, 'failed', task.result || 'pipeline failed')
+    } else if (task.status === 'cancelled') {
+      // Pipeline-detected cancellation: route through dispatcher so
+      // the in-flight slot is released exactly once. Because the
+      // pipeline holds the dispatcher slot via the launcher (no
+      // outer spawned process here), this completes quickly with the
+      // slot released exactly once.
+      await dispatcher.cancelActive(taskId, async () => { /* no extra kill */ })
+      syncTaskRecordFromDispatcher(taskId)
+      // Re-broadcast the final state so subscribers see the cancelled
+      // status from the authoritative dispatcher.
+      broadcast('task:updated', { ...taskStore.get(taskId)!, id: taskId })
+    }
     broadcast('workflow:updated', wf)
     broadcast('task:output', { id: taskId, workflowId, type: 'done', code: task.status === 'completed' ? 0 : 1 })
+    // Final-success metric update: ONLY completed pipelines count as the
+    // coordinator's success. failed/cancelled pipelines already update
+    // the `errors` counter elsewhere and must NOT inflate `tasksCompleted`.
     if (coordinatorId) {
       const act = agentActivity.get(coordinatorId)
-      updateAgentActivity(coordinatorId, { status: 'idle', currentTask: undefined, currentAction: undefined, tasksCompleted: (act?.tasksCompleted || 0) + 1 })
+      const finalOutcome = taskStore.get(taskId)?.status ?? task.status
+      const completedCount = finalOutcome === 'completed' ? (act?.tasksCompleted || 0) + 1 : (act?.tasksCompleted || 0)
+      updateAgentActivity(coordinatorId, { status: 'idle', currentTask: undefined, currentAction: undefined, tasksCompleted: completedCount })
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
@@ -1691,13 +1969,32 @@ async function launchSwarmPipeline(
     if (task.status === 'cancelled') {
       // Don't overwrite a cancellation imposed by an explicit user action.
       task.result = (task.result ? task.result + '\n' : '') + `Pipeline aborted after cancel: ${msg.slice(0, 500)}`
+      // FAIL-CLOSED defect #last: drive the dispatcher's authoritative
+      // cancellation transition so the in-flight slot is released
+      // exactly once. The route's /api/tasks/:id/cancel also drives
+      // this transition, but the pipeline's outer catch can race with
+      // the route — only one of the two paths MUST succeed, and the
+      // guard inside cancelActive ensures idempotency. cancelActive
+      // returns true if the slot was already terminal, false if the
+      // task is unknown — both are safe no-ops here.
+      let dispatcherCancelled = false
+      try {
+        dispatcherCancelled = await dispatcher.cancelActive(taskId, async () => { /* scheduler released above */ })
+      } catch (cancelErr) {
+        console.error(`[TASK ${taskId}] Dispatcher cancellation remained fail-closed:`, cancelErr)
+      }
+      if (dispatcherCancelled && dispatcher.get(taskId)?.status === 'cancelled') {
+        syncTaskRecordFromDispatcher(taskId)
+      }
+      broadcast('task:updated', { ...taskStore.get(taskId) || task, id: taskId })
     } else {
-      task.status = 'failed'
-      task.result = `Pipeline error: ${msg.slice(0, 1000)}`
+      const failureResult = `Pipeline error: ${msg.slice(0, 1000)}`
+      settleTaskTerminal(taskId, 'failed', failureResult)
       wf.status = 'failed'
+      const synced = taskStore.get(taskId)
+      if (synced) wf.result = synced.result
+      broadcast('workflow:updated', wf)
     }
-    broadcast('task:updated', { ...task, id: taskId })
-    broadcast('workflow:updated', wf)
     // Release all agents
     for (const agent of agents) {
       updateAgentActivity(agent.id, { status: 'idle', currentTask: undefined, currentAction: undefined })
@@ -1789,22 +2086,15 @@ function launchViaSwarmCli(
     // swarm start returns immediately after deploying — the actual work continues
     // If it failed to even start, mark as failed
     if (code !== 0 && !swarmId) {
-      task.status = 'failed'
-      task.result = (fullOutput + '\n' + stderrOutput).trim().slice(0, 2000) || `Swarm launch failed (code ${code})`
-      wf.status = 'failed'
-      broadcast('task:updated', { ...task, id: taskId })
-      broadcast('workflow:updated', wf)
+      const result = (fullOutput + '\n' + stderrOutput).trim().slice(0, 2000) || `Swarm launch failed (code ${code})`
+      settleTaskTerminal(taskId, 'failed', result)
       releaseAllBusyAgents(taskId, false)
     }
   })
 
   proc.on('error', (err) => {
     cleanupProcess(taskId)
-    task.status = 'failed'
-    task.result = `Swarm launch error: ${err.message}`
-    wf.status = 'failed'
-    broadcast('task:updated', { ...task, id: taskId })
-    broadcast('workflow:updated', wf)
+    settleTaskTerminal(taskId, 'failed', `Swarm launch error: ${err.message}`)
     releaseAllBusyAgents(taskId, false)
   })
 }
@@ -1820,11 +2110,7 @@ function pollSwarmExecution(taskId: string, swarmId: string, title: string, wf: 
   const poll = async () => {
     if (!taskStore.has(taskId) || task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled') return
     if (Date.now() - startTime > maxDuration) {
-      task.status = 'failed'
-      task.result = 'Swarm execution timed out after 30 minutes'
-      wf.status = 'failed'
-      broadcast('task:updated', { ...task, id: taskId })
-      broadcast('workflow:updated', wf)
+      settleTaskTerminal(taskId, 'failed', 'Swarm execution timed out after 30 minutes')
       releaseAllBusyAgents(taskId, false)
       return
     }
@@ -1867,13 +2153,11 @@ function pollSwarmExecution(taskId: string, swarmId: string, title: string, wf: 
 
       // Check if done (100% or all agents completed)
       if (Number(progress) >= 100) {
-        task.status = 'completed'
-        task.completedAt = new Date().toISOString()
-        task.result = raw.slice(0, 2000) || 'Swarm execution completed'
+        const result = raw.slice(0, 2000) || 'Swarm execution completed'
+        settleTaskTerminal(taskId, 'completed', result)
         wf.status = 'completed'
-        wf.completedAt = task.completedAt
-        wf.result = task.result
-        broadcast('task:updated', { ...task, id: taskId })
+        wf.completedAt = task.completedAt || new Date().toISOString()
+        wf.result = result
         broadcast('workflow:updated', wf)
         broadcast('task:output', { id: taskId, workflowId, type: 'done', code: 0 })
         releaseAllBusyAgents(taskId, true)
@@ -2077,29 +2361,42 @@ function launchViaClaude(
           releaseOnce('fail', { error: new Error(combined || `Process exited with code ${code}`) })
         }
         console.log(`[TASK ${taskId}] Exited with code ${code}. Output length: ${combined.length}`)
+        // CRITICAL: cancelled is preserved here — close handler must NOT
+        // overwrite an explicit user cancel that was settled via
+        // settleTaskTerminal or via cancelActive after waitForProcessClose.
+        // The terminal guard inside settleTaskTerminal enforces this; if
+        // task is already cancelled/interrupted, it is a no-op.
         if (task.status === 'cancelled') {
           wf.status = 'cancelled'
           wf.completedAt = task.completedAt || new Date().toISOString()
+          broadcast('workflow:updated', wf)
         } else if (code === 0) {
-          task.status = 'completed'
-          task.completedAt = new Date().toISOString()
-          task.result = fullOutput.slice(0, 2000) || 'Task completed'
-          wf.status = 'completed'
-          wf.completedAt = task.completedAt
-          wf.result = task.result
+          // Funnel through the explicit terminal helper.
+          settleTaskTerminal(taskId, 'completed', fullOutput.slice(0, 2000) || 'Task completed')
+          // Mirror to wf.result for legacy callers.
+          const synced = taskStore.get(taskId)
+          if (synced && wf) {
+            wf.status = 'completed'
+            wf.completedAt = synced.completedAt || new Date().toISOString()
+            wf.result = synced.result
+            broadcast('workflow:updated', wf)
+          }
         } else {
-          task.status = 'failed'
-          task.result = combined.slice(0, 2000) || `Process exited with code ${code}`
-          wf.status = 'failed'
-          wf.result = task.result
+          settleTaskTerminal(taskId, 'failed', combined.slice(0, 2000) || `Process exited with code ${code}`)
+          const synced = taskStore.get(taskId)
+          if (synced && wf) {
+            wf.status = 'failed'
+            wf.result = synced.result
+            broadcast('workflow:updated', wf)
+          }
         }
-        broadcast('task:updated', { ...task, id: taskId })
-        broadcast('workflow:updated', wf)
-        broadcast('task:output', { id: taskId, workflowId, type: 'done', code: task.status === 'completed' ? 0 : 1 })
-        releaseAllBusyAgents(taskId, task.status === 'completed')
+        // Re-read status AFTER the helper call (it may be unchanged if cancelled).
+        const finalStatus = taskStore.get(taskId)?.status ?? task.status
+        broadcast('task:output', { id: taskId, workflowId, type: 'done', code: finalStatus === 'completed' ? 0 : 1 })
+        releaseAllBusyAgents(taskId, finalStatus === 'completed')
         const activity = agentActivity.get(workingAgentId)
-        const completed = (activity?.tasksCompleted || 0) + (task.status === 'completed' ? 1 : 0)
-        const errors = (activity?.errors || 0) + (task.status === 'failed' ? 1 : 0)
+        const completed = (activity?.tasksCompleted || 0) + (finalStatus === 'completed' ? 1 : 0)
+        const errors = (activity?.errors || 0) + (finalStatus === 'failed' ? 1 : 0)
         updateAgentActivity(workingAgentId, { status: 'idle', currentTask: undefined, currentAction: undefined, tasksCompleted: completed, errors })
     })
 
@@ -2107,19 +2404,22 @@ function launchViaClaude(
         cleanupProcess(taskId)
         console.error(`[TASK ${taskId}] Process error: ${err.message}`)
         releaseOnce('fail', { error: err })
+        // CRITICAL: preserve cancelled.
         if (task.status !== 'cancelled') {
-          task.status = 'failed'
-          task.result = `Process error: ${err.message}`
-          wf.status = 'failed'
-          wf.result = task.result
+          settleTaskTerminal(taskId, 'failed', `Process error: ${err.message}`)
+          const synced = taskStore.get(taskId)
+          if (synced && wf) {
+            wf.status = 'failed'
+            wf.result = synced.result
+            broadcast('workflow:updated', wf)
+          }
         } else {
           wf.status = 'cancelled'
           wf.completedAt = task.completedAt || new Date().toISOString()
+          broadcast('workflow:updated', wf)
         }
-        broadcast('task:updated', { ...task, id: taskId })
-        broadcast('workflow:updated', wf)
       })
-  }).catch((err) => {
+  }).catch(async (err) => {
     // Dispatch was rejected (cancelled / task-cancelled / dep-failed /
     // dep-cancelled / dispatch-timeout / scheduled-shutdown / no-match).
     // Per blocker 6 we MUST NOT spawn a process.
@@ -2128,23 +2428,41 @@ function launchViaClaude(
     console.warn(`[TASK ${taskId}] launchViaClaude dispatch rejected (${reason || 'unknown'}): ${msg}`)
     releaseOnce('cancel')
     // Don't overwrite an explicit user cancellation; otherwise mark failed.
-    if (task.status !== 'cancelled') {
-      task.status = (reason === 'task-cancelled' || reason === 'dependency-cancelled' || reason === 'scheduled-shutdown' || reason === 'dispatch-timeout')
-        ? 'cancelled'
-        : 'failed'
+    // Funnel through the explicit terminal helper.
+    if (task.status === 'cancelled' || task.status === 'interrupted') {
+      // Preserve cancelled/interrupted — do nothing.
+    } else if (reason === 'task-cancelled' || reason === 'dependency-cancelled' || reason === 'scheduled-shutdown' || reason === 'dispatch-timeout') {
+      // Treat scheduler-cancelled as a cancellation via the dispatcher.
+      // Defect #6: AWAIT the dispatcher's settlement before broadcasting.
+      // No spawned process exists yet (that's why we're in the catch),
+      // so the cancellation chain completes quickly without leaks; the
+      // slot is released exactly once.
+      const cancelResult = `Dispatch rejected (${reason || 'unknown'}): ${msg.slice(0, 500)}`
+      // Reflect the cancellation on the visible state.
       task.completedAt = new Date().toISOString()
-      task.result = `Dispatch rejected (${reason || 'unknown'}): ${msg.slice(0, 500)}`
-      if (task.status === 'failed') {
+      task.result = cancelResult
+      task.status = 'cancelled'
+      wf.status = 'cancelled'
+      wf.completedAt = task.completedAt
+      wf.result = cancelResult
+      // AWAIT the dispatcher's cancellation settlement.
+      await dispatcher.cancelActive(taskId, async () => { /* scheduler released above */ })
+      // Only broadcast AFTER the authoritative dispatcher transition
+      // so subscribers observe the cancelled state directly.
+      syncTaskRecordFromDispatcher(taskId)
+      broadcast('task:updated', { ...task, id: taskId })
+      broadcast('workflow:updated', wf)
+    } else {
+      settleTaskTerminal(taskId, 'failed', `Dispatch rejected (${reason || 'unknown'}): ${msg.slice(0, 500)}`)
+      const synced = taskStore.get(taskId)
+      if (synced && wf) {
         wf.status = 'failed'
-        wf.result = task.result
-      } else {
-        wf.status = 'cancelled'
-        wf.completedAt = task.completedAt
+        wf.result = synced.result
+        broadcast('workflow:updated', wf)
       }
     }
-    broadcast('task:updated', { ...task, id: taskId })
-    broadcast('workflow:updated', wf)
-    broadcast('task:output', { id: taskId, workflowId, type: 'done', code: task.status === 'completed' ? 0 : 1 })
+    const finalStatus = taskStore.get(taskId)?.status ?? task.status
+    broadcast('task:output', { id: taskId, workflowId, type: 'done', code: finalStatus === 'completed' ? 0 : 1 })
   })
 }
 
@@ -2537,8 +2855,42 @@ interface TaskRecord {
   cwd?: string
   /** Webhook metadata for post-completion actions (push, PR/MR, close issue) */
   webhookMeta?: WebhookMeta
+  /** Resolved mode from PACKET-ID / description / explicit override. */
+  mode?: 'WRITE' | 'READ-ONLY'
+  /** Source cwd captured at task creation (READ-ONLY executes here). */
+  sourceCwd?: string
+  /** Execution cwd passed to claude -p — worktree path for WRITE, source for READ-ONLY. */
+  executionCwd?: string
+  /** Persisted git worktree metadata once provisioning succeeded. */
+  worktreePath?: string
+  branchName?: string
+  baseCommit?: string
+  /** Queue state mirror — useful for clients that don't query the status endpoint. */
+  queueState?: 'queued' | 'dispatching' | 'running' | 'terminal'
+  queuePosition?: number
+  /** Attempt counter (terminal tasks are never re-run even on retry calls). */
+  attempt?: number
 }
 const taskStore: Map<string, TaskRecord> = new Map()
+
+/**
+ * Canonical task cancellation helper. Thin shim over `cancelTaskImpl`
+ * in `./task-lifecycle.ts`. The shared lifecycle is the same code path
+ * used by:
+ *   - POST /api/tasks/:id/cancel      (HTTP route)
+ *   - Telegram /cancel                (TelegramStores.cancelTask)
+ *   - /api/workflows/:id/cancel       (linked-task cancel)
+ *   - launchViaClaude dispatch-rejection cancellation
+ */
+type CancelMode = 'pending' | 'active' | 'noop'
+async function cancelTask(taskId: string, opts: { reason?: string } = {}): Promise<{
+  ok: boolean
+  alreadyTerminal?: boolean
+  mode: CancelMode
+  status?: string
+}> {
+  return cancelTaskImpl(buildLifecycleDeps(), taskId, opts)
+}
 
 function taskRoutes(): Router {
   const r = Router()
@@ -2548,18 +2900,31 @@ function taskRoutes(): Router {
     const pending = all.filter(t => t.status === 'pending').length
     const inProgress = all.filter(t => t.status === 'in_progress').length
     const failed = all.filter(t => t.status === 'failed' || t.status === 'cancelled').length
+    const interrupted = all.filter(t => t.status === 'interrupted').length
     res.json({
-      total: all.length, completed, pending, inProgress, failed,
+      total: all.length, completed, pending, inProgress, failed, interrupted,
       completionRate: all.length > 0 ? completed / all.length : 0,
       averageTime: '--',
+      // Dispatcher-aware counters so the UI can display live queue depth.
+      maxInFlight: dispatcher.maxInFlightValue,
+      inFlight: dispatcher.inFlightSize,
+      queued: dispatcher.pendingSize,
+      terminal: dispatcher.terminalSize,
     })
   }))
   r.get('/', h(async (_req, res) => {
-    res.json({ tasks: [...taskStore.values()] })
+    // Refresh each task from the dispatcher view so list responses stay
+    // consistent with what the status endpoint would return.
+    const tasks = [...taskStore.values()].map(t => {
+      syncTaskRecordFromDispatcher(t.id)
+      return { ...taskStore.get(t.id)! }
+    })
+    res.json({ tasks })
   }))
   r.post('/', h(async (req, res) => {
-    const { title, description, priority, assignTo, cwd } = req.body || {}
-    // Create via CLI to get a proper ID
+    const { title, description, priority, assignTo, cwd, packetId, mode } = req.body || {}
+    // Create via CLI to get a proper ID (best-effort; we fall back to a
+    // local id if the CLI is unavailable).
     let taskId = `task-${Date.now()}`
     try {
       const args = ['create', '--type', 'implementation', '--description', `${title}: ${description || ''}`]
@@ -2574,97 +2939,137 @@ function taskRoutes(): Router {
     const resolvedCwd = cwd && typeof cwd === 'string' && cwd.trim()
       ? (fs.existsSync(cwd.trim()) ? cwd.trim() : undefined)
       : undefined
-    const task: TaskRecord = {
+    const effectivePriority: Priority = (priority && ['critical', 'high', 'normal', 'low'].includes(priority))
+      ? priority as Priority
+      : 'normal'
+    // Determine MODE — explicit caller overrides detection (used by tests/UI).
+    const detectedMode: TaskMode = (mode === 'READ-ONLY' || mode === 'WRITE')
+      ? mode as TaskMode
+      : detectTaskMode({ packetId, title: title || '', description: description || '' })
+    // Single explicit creation + enqueue path. NO direct call to
+    // launchWorkflowForTask — only dispatcherLauncher invokes that.
+    const result = createAndEnqueueTask({
       id: taskId,
       title: title || 'Untitled',
       description: description || '',
-      status: assignTo ? 'in_progress' : 'pending',
-      priority: priority || 'normal',
-      assignedTo: assignTo || undefined,
-      createdAt: new Date().toISOString(),
-      startedAt: assignTo ? new Date().toISOString() : undefined,
-      cwd: resolvedCwd,
+      mode: detectedMode,
+      priority: effectivePriority,
+      sourceCwd: resolvedCwd || process.cwd(),
+      assignedTo: assignTo ? String(assignTo) : undefined,
+    })
+    if (!result.created) {
+      // Duplicate — surface idempotent result without an extra launch.
+      res.status(200).json({ ...result.task, duplicate: true })
+      return
     }
-    taskStore.set(taskId, task)
-    broadcast('task:added', task)
-    res.json(task)
-
-    // If assigned on creation, execute in background
-    if (assignTo) {
-      launchWorkflowForTask(taskId, task.title, task.description)
-    }
+    res.json(result.task)
   }))
   r.get('/:id/status', h(async (req, res) => {
-    const task = taskStore.get(String(req.params.id))
-    res.json(task || { error: 'Task not found' })
+    const id = String(req.params.id)
+    const task = taskStore.get(id)
+    if (!task) { res.status(404).json({ error: 'Task not found' }); return }
+    syncTaskRecordFromDispatcher(id)
+    const dTask = dispatcher.get(id)
+    res.json({
+      ...task,
+      id,
+      // Dispatcher-aware queue / worktree metadata for the UI.
+      queueState: task.queueState || (dTask?.status === 'pending' ? 'queued'
+        : dTask?.status === 'in_progress' ? 'running'
+        : dTask ? 'terminal' : 'unknown'),
+      queuePosition: dTask ? dispatcher.queuePosition(id) : 0,
+      maxInFlight: dispatcher.maxInFlightValue,
+      inFlight: dispatcher.inFlightSize,
+      pending: dispatcher.pendingSize,
+      worktree: dTask?.worktree ? {
+        path: dTask.worktree.worktreePath,
+        branch: dTask.worktree.branchName,
+        baseCommit: dTask.worktree.baseCommit,
+        createdAt: dTask.worktree.createdAt,
+      } : null,
+      mode: dTask?.mode || task.mode,
+      sourceCwd: dTask?.sourceCwd || task.sourceCwd,
+      executionCwd: dTask?.executionCwd || task.executionCwd,
+      attempt: dTask?.attempt ?? task.attempt ?? 0,
+      terminalReason: dTask?.terminalReason,
+    })
   }))
   r.post('/:id/assign', h(async (req, res) => {
     const id = String(req.params.id)
     const { agentId } = req.body || {}
     const task = taskStore.get(id)
-    if (task) {
-      task.assignedTo = agentId
-      task.status = 'in_progress'
-      task.startedAt = new Date().toISOString()
-      broadcast('task:updated', { ...task, id })
-
-      // Execute in background via claude-flow workflow
-      launchWorkflowForTask(id, task.title, task.description)
+    if (!task) {
+      res.status(404).json({ error: 'Task not found' })
+      return
     }
-    res.json({ id, assigned: true, agentId })
+    // B7: /assign MUST NOT bypass the dispatcher. Only dispatcher-owned
+    // pending tasks can be assigned; the actual launch happens from the
+    // dispatcher's prepared-then-in_progress path. Terminal records
+    // cannot be re-assigned.
+    const dr = dispatcher.get(id)
+    if (!dr) {
+      res.status(409).json({ error: 'Task is not dispatcher-owned; cannot assign' })
+      return
+    }
+    if (dispatcherIsAlreadyTerminal(dr) || dr.status === 'in_progress' || dr.status === 'preparing') {
+      res.status(409).json({ error: `Task is ${dr.status}; cannot assign`, status: dr.status })
+      return
+    }
+    if (dr.status !== 'pending') {
+      res.status(409).json({ error: `Task is ${dr.status}; cannot assign`, status: dr.status })
+      return
+    }
+    dr.assignedTo = String(agentId || '')
+    task.assignedTo = String(agentId || '')
+    syncTaskRecordFromDispatcher(id)
+    broadcast('task:updated', { ...task, id })
+    persistState()
+    res.json({ id, assigned: true, agentId: dr.assignedTo })
   }))
   r.post('/:id/complete', h(async (req, res) => {
     const id = String(req.params.id)
     const task = taskStore.get(id)
-    if (task) {
-      task.status = 'completed'
-      task.completedAt = new Date().toISOString()
-      task.result = req.body?.result || 'Completed'
-      broadcast('task:updated', { ...task, id })
-    }
-    res.json({ id, completed: true })
+    if (!task) { res.status(404).json({ error: 'Task not found' }); return }
+    // Funnel through the explicit terminal settlement helper so the
+    // dispatcher slot is released exactly once and cancelled/interrupted
+    // states cannot be overwritten.
+    const result = req.body?.result || 'Completed'
+    // Preserve terminal result text on the TaskRecord before settling.
+    task.result = result
+    task.completedAt = new Date().toISOString()
+    const settled = settleTaskTerminal(id, 'completed', result)
+    res.json({ id, completed: true, settled })
   }))
   r.post('/:id/cancel', h(async (req, res) => {
     const id = String(req.params.id)
-    const task = taskStore.get(id)
-    if (task) {
-      // Force cancel regardless of current status (handles stuck tasks)
-      task.status = 'cancelled'
-      task.completedAt = task.completedAt || new Date().toISOString()
-      broadcast('task:updated', { ...task, id })
-
-      // Kill running processes for this task
-      for (const [key, proc] of runningProcesses.entries()) {
-        if (key.startsWith(id) && !proc.killed) {
-          proc.kill('SIGTERM')
-          setTimeout(() => { if (!proc.killed) proc.kill('SIGKILL') }, 5000)
-          cleanupProcess(key)
-        }
+    const result = await cancelTask(id, { reason: 'http-cancel' })
+    if (!result.ok) {
+      if (result.mode === 'noop' && !result.status) {
+        res.status(404).json({ error: 'Task not found' })
+        return
       }
-
-      // Cancel every scheduler subtask tied to this task so dependents
-      // surface typed dependency-cancelled errors and never re-run later.
-      try { getGlobalScheduler().cancelTask(id) } catch { /* scheduler may be torn down */ }
-
-      // Cancel linked workflow
-      for (const [wfId, wf] of workflowStore.entries()) {
-        if (wf.taskId === id && wf.status !== 'completed' && wf.status !== 'cancelled') {
-          wf.status = 'cancelled'
-          wf.completedAt = new Date().toISOString()
-          wf.steps.forEach(s => { if (s.status === 'running' || s.status === 'pending') s.status = 'cancelled' })
-          broadcast('workflow:updated', wf)
-        }
-      }
+      res.json({ id, cancelled: false, status: result.status })
+      return
     }
-    res.json({ id, cancelled: true })
+    if (result.alreadyTerminal) {
+      res.json({ id, cancelled: false, alreadyTerminal: true, status: result.status })
+      return
+    }
+    res.json({ id, cancelled: true, mode: result.mode })
   }))
 
-  // Delete completed/failed/cancelled tasks
+  // Delete completed/failed/cancelled/interrupted tasks. The dispatcher
+// is asked to forgetTerminal for each removed task so its terminal slot
+// is reclaimed. Worktrees/branches are NEVER auto-removed — operator
+// drives cleanup of git artefacts.
   r.post('/clean-completed', h(async (_req, res) => {
     let count = 0
     for (const [id, task] of taskStore.entries()) {
-      if (task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled') {
+      if (task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled' || task.status === 'interrupted') {
         taskStore.delete(id)
+        // Forget the dispatcher terminal record so its memory is reclaimed
+        // and future hydrateFromSnapshot cannot restore it. Idempotent.
+        try { dispatcher.forgetTerminal(id) } catch { /* ignore */ }
         count++
       }
     }
@@ -2672,7 +3077,13 @@ function taskRoutes(): Router {
     res.json({ ok: true, deleted: count })
   }))
 
-  // Task continuation — create a follow-up task with previous context
+  // Task continuation — create a follow-up task with previous context.
+// The continuation is created pending (NOT in_progress) and goes through
+// the dispatcher. sourceCwd is taken from the parent's sourceCwd (or
+// parent.cwd as a fallback for older records) — NEVER from the parent's
+// executionCwd, which may point at a per-task worktree that has been or
+// will be torn down. WRITE continuations receive their own fresh branch
+// + worktree from the dispatcher.
   r.post('/:id/continue', h(async (req, res) => {
     const parentId = String(req.params.id)
     const parentTask = taskStore.get(parentId)
@@ -2681,8 +3092,7 @@ function taskRoutes(): Router {
     const { instruction } = req.body || {}
     if (!instruction?.trim()) { res.status(400).json({ error: 'instruction is required' }); return }
 
-    // Build new task with context from parent
-    const taskId = `task-${Date.now()}`
+    // Preserve the parent's result context (mandatory per spec).
     const prevResult = parentTask.result?.slice(0, 1500) || 'No result captured'
     const prevOutput = readTaskOutputHistory(parentId, 50)
     const outputSummary = prevOutput.map(o => o.content).join('\n').slice(0, 2000)
@@ -2699,22 +3109,29 @@ function taskRoutes(): Router {
       instruction,
     ].filter(Boolean).join('\n')
 
-    const newTask: TaskRecord = {
-      id: taskId,
+    // sourceCwd: parent.sourceCwd OR parent.cwd (legacy), never
+    // parent.executionCwd (which may live in a per-task worktree).
+    const parentDr = dispatcher.get(parentId)
+    const sourceCwd = (parentDr?.sourceCwd) || parentTask.cwd || parentTask.sourceCwd || process.cwd()
+    // Mode: inherit parent's mode. WRITE continuations get their own
+    // fresh branch + worktree from the dispatcher's provisioning.
+    const parentMode: TaskMode = parentTask.mode === 'READ-ONLY' ? 'READ-ONLY' : 'WRITE'
+
+    // Route through the single explicit creation path. The dispatcher
+    // will provision a fresh worktree (for WRITE) and call the
+    // dispatcherLauncher — only place that may invoke launchWorkflowForTask.
+    const parentPriority: Priority = (parentTask.priority && ['critical', 'high', 'normal', 'low'].includes(parentTask.priority))
+      ? parentTask.priority as Priority
+      : 'normal'
+    const result = createAndEnqueueTask({
       title: `${parentTask.title} (continued)`,
       description: contextBlock,
-      status: 'in_progress',
-      priority: parentTask.priority,
-      assignedTo: parentTask.assignedTo || 'swarm',
-      createdAt: new Date().toISOString(),
-      startedAt: new Date().toISOString(),
-    }
-    taskStore.set(taskId, newTask)
-    broadcast('task:added', newTask)
-    res.json(newTask)
-
-    // Execute in background
-    launchWorkflowForTask(taskId, newTask.title, newTask.description)
+      mode: parentMode,
+      priority: parentPriority,
+      sourceCwd,
+      assignedTo: parentTask.assignedTo,
+    })
+    res.json(result.task)
   }))
 
   // Task output history — retrieve persisted output lines
@@ -3194,21 +3611,13 @@ function workflowRoutes(): Router {
       wf.steps.forEach(s => { if (s.status === 'running' || s.status === 'pending') s.status = 'cancelled' })
       broadcast('workflow:updated', wf)
 
-      // Also cancel the linked task and kill its processes
+      // Cancel the linked task through the canonical helper so the
+      // shared async lifecycle (close listeners before SIGTERM,
+      // awaited close + SIGKILL fallback, dispatch cancellation
+      // settlement) is reused. We NEVER write task.status directly
+      // and we NEVER bypass the dispatcher.
       if (wf.taskId) {
-        const task = taskStore.get(wf.taskId)
-        if (task && task.status !== 'completed' && task.status !== 'failed' && task.status !== 'cancelled') {
-          task.status = 'cancelled'
-          broadcast('task:updated', { ...task, id: wf.taskId })
-        }
-        // Kill running processes for this task
-        for (const [key, proc] of runningProcesses.entries()) {
-          if (key.startsWith(wf.taskId) && !proc.killed) {
-            proc.kill('SIGTERM')
-            setTimeout(() => { if (!proc.killed) proc.kill('SIGKILL') }, 5000)
-            cleanupProcess(key)
-          }
-        }
+        await cancelTask(wf.taskId, { reason: 'workflow-cancel' })
       }
     }
 
@@ -3642,7 +4051,95 @@ function parseWebhookTitle(title: string): { repo: string; issueNumber: number }
   return { repo: m[1], issueNumber: Number(m[2]) }
 }
 
-// Shared webhook task creator — clones repo, sets cwd, attaches metadata
+/**
+ * Single explicit task creation + dispatch enqueue path.
+ *
+ * Every entry point that wants to create a new top-level task MUST go
+ * through this helper — there are no exceptions:
+ *
+ *   - POST /api/tasks (HTTP)
+ *   - POST /api/tasks/:id/continue (continuation)
+ *   - Telegram createAndAssignTask
+ *   - Successful GitHub/GitLab webhook task creation
+ *
+ * After this helper returns, the only place that may invoke
+ * `launchWorkflowForTask` is `dispatcherLauncher` — set via
+ * `setDispatcherLauncher` once at boot.
+ *
+ * The helper:
+ *   1. Resolves a fresh task id.
+ *   2. Inserts a TaskRecord with status='pending' (NEVER 'in_progress').
+ *   3. Enqueues through `dispatcher.enqueue`, which honours
+ *      priority+FIFO and the max-in-flight cap.
+ *   4. Broadcasts task:added. The dispatcher owns in_progress — the
+ *      route handler MUST NOT pre-set it.
+ *   5. Returns the TaskRecord. The dispatcher's prepare→provision→
+ *      in_progress lifecycle is what actually launches Claude.
+ */
+function createAndEnqueueTask(input: {
+  title: string
+  description: string
+  mode: TaskMode
+  priority: Priority
+  sourceCwd: string
+  assignedTo?: string
+  /** Optional pre-computed taskId (callers that need a stable id). */
+  id?: string
+}): { taskId: string; task: TaskRecord; created: boolean } {
+  const id = input.id || `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  // 1. Enqueue through the dispatcher FIRST so the authoritative state
+  //    lives in one place. The dispatcher enqueue is idempotent.
+  const { task: dTask, created } = dispatcher.enqueue({
+    id,
+    title: input.title,
+    description: input.description,
+    mode: input.mode,
+    priority: input.priority,
+    sourceCwd: input.sourceCwd,
+    assignedTo: input.assignedTo,
+  })
+  // 2. Build the legacy TaskRecord mirror. Status is pending — NEVER
+  //    in_progress here. The dispatcher promotes pending → preparing →
+  //    in_progress during its own dispatch tick.
+  const task: TaskRecord = {
+    id,
+    title: dTask.title,
+    description: dTask.description,
+    status: 'pending',
+    priority: dTask.priority,
+    createdAt: dTask.createdAt,
+    cwd: dTask.sourceCwd,
+    mode: dTask.mode,
+    worktreePath: dTask.worktree?.worktreePath,
+    branchName: dTask.worktree?.branchName,
+    baseCommit: dTask.worktree?.baseCommit,
+    executionCwd: dTask.executionCwd,
+    queueState: 'queued',
+    queuePosition: dispatcher.queuePosition(id),
+    attempt: dTask.attempt,
+    assignedTo: dTask.assignedTo,
+  }
+  taskStore.set(id, task)
+  broadcast('task:added', task)
+  if (!created) {
+    // Duplicate — surface idempotent result.
+    return { taskId: id, task, created: false }
+  }
+  persistState()
+  return { taskId: id, task, created: true }
+}
+
+// Shared webhook task creator — clones repo, sets cwd, attaches metadata.
+//
+// After ACC-TASK-QUEUE-002-FINAL-REPAIR: this function does NOT do
+// `git checkout -b` (the dispatcher creates the branch via worktree
+// provisioning for WRITE tasks). The repo dir is captured as
+// sourceCwd; the dispatcher's write-provisioning path creates a fresh
+// `ruflo-task/<repoId>-<taskId>` branch + worktree off HEAD.
+//
+// Clone failure is fail-closed: we DO NOT fall back to the rufloui
+// cwd. The task is marked failed (terminal), no Claude process is
+// spawned, no dispatcher slot is leased.
 async function createWebhookTask(
   provider: 'github' | 'gitlab',
   title: string,
@@ -3651,56 +4148,61 @@ async function createWebhookTask(
 ): Promise<{ taskId: string; assigned: boolean }> {
   const id = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
   const parsed = parseWebhookTitle(title)
-  const task: TaskRecord = {
-    id, title, description, status: 'pending', priority: 'high',
-    createdAt: new Date().toISOString(),
-  }
+  let sourceCwd: string | undefined
+  let webhookMeta: TaskRecord['webhookMeta']
 
-  // Clone the repo and set working directory
   if (parsed) {
     const token = provider === 'github'
       ? githubWebhookConfig.githubToken
       : gitlabWebhookConfig.gitlabToken
-    const branchName = `fix/issue-${parsed.issueNumber}`
-
     try {
       const repoDir = await cloneWebhookRepo(provider, parsed.repo, token, issueUrl)
-      task.cwd = repoDir
-
-      // Create the fix branch
-      // Create branch or switch to it if it already exists
-      await execAsync(`git checkout -b "${branchName}"`, { cwd: repoDir }).catch(() =>
-        execAsync(`git checkout "${branchName}"`, { cwd: repoDir })
-      )
-
+      sourceCwd = repoDir
       let host = provider === 'gitlab' ? 'gitlab.com' : 'github.com'
       try { host = new URL(issueUrl).host } catch { /* use default */ }
-      task.webhookMeta = {
+      // branchName field is the LEGACY desired name used by old push/MR
+      // code paths; the actual branch is created by the dispatcher during
+      // worktree provisioning (worktreeProvisioned handler updates this).
+      const branchName = `fix/issue-${parsed.issueNumber}`
+      webhookMeta = {
         provider, repo: parsed.repo, issueNumber: parsed.issueNumber,
         issueUrl, branchName, host,
       }
-      console.log(`[webhook-repo] Task ${id} will work in ${repoDir} on branch ${branchName}`)
+      console.log(`[webhook-repo] Task ${id} will work in ${repoDir} on dispatcher-managed branch`)
     } catch (err) {
       console.error(`[webhook-repo] Clone failed for ${parsed.repo}:`, err)
-      // Do NOT fallback to rufloui cwd — fail the task instead
-      task.status = 'failed'
-      task.result = `Failed to clone repository ${parsed.repo}: ${err instanceof Error ? err.message : String(err)}`
-      taskStore.set(id, task)
-      broadcast('task:added', task)
+      // Fail-closed: do NOT fallback to rufloui cwd.
+      // Create the task as a terminal failed record (no dispatcher slot).
+      const failedTask: TaskRecord = {
+        id, title, description, status: 'failed',
+        result: `Failed to clone repository ${parsed.repo}: ${err instanceof Error ? err.message : String(err)}`,
+        priority: 'high',
+        createdAt: new Date().toISOString(),
+        completedAt: new Date().toISOString(),
+      }
+      taskStore.set(id, failedTask)
+      broadcast('task:added', failedTask)
       return { taskId: id, assigned: false }
     }
   }
 
-  taskStore.set(id, task)
-  broadcast('task:added', task)
-  if (!swarmShutdown) {
-    task.status = 'in_progress'
-    task.startedAt = new Date().toISOString()
-    broadcast('task:updated', { ...task, id })
-    launchWorkflowForTask(id, title, description)
-    return { taskId: id, assigned: true }
+  // Route through the single explicit creation helper. The dispatcher
+  // (NOT this function) decides when/whether to launch — and for WRITE
+  // tasks it provisions a fresh branch + worktree.
+  const result = createAndEnqueueTask({
+    id,
+    title,
+    description,
+    mode: 'WRITE', // webhook tasks are always WRITE — they edit the repo
+    priority: 'high',
+    sourceCwd: sourceCwd || process.cwd(),
+  })
+  if (webhookMeta) {
+    result.task.webhookMeta = webhookMeta
+    taskStore.set(id, result.task)
   }
-  return { taskId: id, assigned: false }
+  if (!result.created) return { taskId: id, assigned: false }
+  return { taskId: id, assigned: !swarmShutdown }
 }
 
 app.use('/api/webhooks', githubWebhookRoutes(
@@ -3782,32 +4284,28 @@ function getTelegramStores() {
       }
     },
     createAndAssignTask: async (title: string, description: string) => {
-      const id = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-      const task = {
-        id, title, description, status: 'pending',
-        priority: 'medium', createdAt: new Date().toISOString(),
-      }
-      taskStore.set(id, task)
-      broadcast('task:added', task)
-      if (!swarmShutdown) {
-        task.status = 'in_progress'
-        const startedAt = new Date().toISOString()
-        Object.assign(task, { startedAt })
-        broadcast('task:updated', { ...task, id })
-        launchWorkflowForTask(id, task.title, task.description)
-        return { taskId: id, assigned: true }
-      }
-      return { taskId: id, assigned: false }
+      // Telegram bot uses normal priority and the SINGLE explicit
+      // creation path. No direct launchWorkflowForTask — only
+      // dispatcherLauncher may invoke it.
+      const result = createAndEnqueueTask({
+        title, description,
+        mode: 'WRITE',
+        priority: 'normal',
+        sourceCwd: process.cwd(),
+      })
+      return { taskId: result.taskId, assigned: !swarmShutdown }
     },
     cancelTask: async (taskId: string) => {
-      const task = taskStore.get(taskId)
-      if (!task) return { ok: false, error: 'Task not found' }
-      if (task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled') {
-        return { ok: false, error: `Task already ${task.status}` }
+      // Telegram cancel routes through the SAME canonical helper that
+      // HTTP /api/tasks/:id/cancel and /api/workflows/:id/cancel use.
+      // No duplicate signal/wait logic.
+      const result = await cancelTask(taskId, { reason: 'telegram-cancel' })
+      if (!result.ok && result.mode === 'noop' && !result.status) {
+        return { ok: false, error: 'Task not found' }
       }
-      task.status = 'cancelled'
-      task.completedAt = new Date().toISOString()
-      broadcast('task:updated', { ...task, id: taskId })
+      if (result.alreadyTerminal) {
+        return { ok: false, error: `Task already ${result.status}` }
+      }
       return { ok: true }
     },
     addLog: addTelegramLog,

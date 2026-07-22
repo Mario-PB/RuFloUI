@@ -30,7 +30,7 @@ export interface Task {
   id: string
   title: string
   description: string
-  status: 'pending' | 'in_progress' | 'completed' | 'cancelled' | 'failed'
+  status: 'pending' | 'in_progress' | 'completed' | 'cancelled' | 'failed' | 'interrupted'
   assignedTo?: string
   priority: 'low' | 'normal' | 'high' | 'critical'
   createdAt: string
@@ -38,6 +38,20 @@ export interface Task {
   result?: string
   /** Working directory for agent execution */
   cwd?: string
+  /** Source cwd captured at task creation. READ-ONLY executes here; WRITE never touches it. */
+  sourceCwd?: string
+  /** Execution cwd passed to claude -p — worktree path for WRITE, source for READ-ONLY. */
+  executionCwd?: string
+  /** Per-WRITE worktree path. Absent for READ-ONLY. */
+  worktreePath?: string
+  branchName?: string
+  baseCommit?: string
+  /** Resolved from PACKET-ID / description / explicit override. */
+  mode?: 'WRITE' | 'READ-ONLY'
+  /** Mirror of dispatcher queue state. */
+  queueState?: 'queued' | 'dispatching' | 'running' | 'terminal'
+  queuePosition?: number
+  attempt?: number
 }
 
 export interface MemoryEntry {
